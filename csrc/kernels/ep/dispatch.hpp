@@ -47,6 +47,7 @@ static void launch_dispatch(void* x, void* sf,
                             int* num_unaligned_recv_tokens_per_expert,
                             int* dst_buffer_slot_idx,
                             int* token_metadata_at_forward,
+                            int* token_map_at_dispatch,
                             const int& num_tokens, const int& num_max_tokens_per_rank,
                             const int& hidden, const int& elem_size,
                             const int& num_sf_packs, const int& sf_token_stride, const int& sf_hidden_stride,
@@ -58,10 +59,21 @@ static void launch_dispatch(void* x, void* sf,
                             const int& num_scaleout_ranks, const int& num_scaleup_ranks,
                             const bool& is_scaleup_nvlink,
                             const int& num_sms, const int& num_channels_per_sm,
+                            const int& gin_indexed_signals_cnt,
                             const int& num_smem_bytes,
                             const int& num_qps, const int64_t& num_timeout_cycles,
                             const bool& cached_mode,
                             const bool& do_cpu_sync,
+                            // Double-buffer the forward warp's TMA loads. Only enabled when compute
+                            // overlap is off; overlap runs keep the original single-buffer path.
+                            const bool& double_buffer_forward,
+                            // Combine-time reduction mode. Only affects the hybrid kernel's
+                            // `token_map_at_dispatch` slot encoding; direct dispatch ignores it.
+                            const bool& allow_multiple_reduction,
+                            // Expanded dispatch. Selects the matching slot encoding for the combine
+                            // this handle feeds; direct dispatch ignores it.
+                            const bool& do_expand,
+                            const int& dispatch_iteration,
                             const at::cuda::CUDAStream& stream) {
     // Cached mode does not support expert token counting
     if (cached_mode)
@@ -112,16 +124,20 @@ static void launch_dispatch(void* x, void* sf,
             num_qps, num_timeout_cycles);
     } else {
         header_name = "hybrid_dispatch_unordered";
-        func_name = std::format("hybrid_unordered_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+        func_name = std::format("hybrid_unordered_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
             do_cpu_sync,
             reuse_slot_indices,
+            allow_multiple_reduction,
+            do_expand,
+            double_buffer_forward,
             num_sms,
             num_notify_warps, num_scaleout_warps, num_forward_warps,
             num_scaleout_ranks, num_scaleup_ranks,
             hidden * elem_size, num_sf_packs,
             num_max_tokens_per_rank,
             num_experts, num_topk, expert_alignment,
-            num_qps, num_timeout_cycles);
+            num_qps, num_timeout_cycles,
+            gin_indexed_signals_cnt);
     }
     const auto kernel = jit->compile("dispatch", std::format(R"(
 #include <deep_ep/impls/ep/{}.cuh>
@@ -166,12 +182,14 @@ static void __instantiate_kernel() {{
             num_unaligned_recv_tokens_per_expert,
             dst_buffer_slot_idx,
             token_metadata_at_forward,
+            token_map_at_dispatch,
             num_tokens,
             sf_token_stride, sf_hidden_stride,
             nccl_dev_comm, nccl_window,
             buffer,
             workspace, mapped_host_workspace,
-            scaleout_rank_idx, scaleup_rank_idx
+            scaleout_rank_idx, scaleup_rank_idx,
+            dispatch_iteration
         );
     }
 }

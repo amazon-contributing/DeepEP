@@ -49,6 +49,8 @@ class EPBuffer: public BufferBase {
     // Whether to prefer overlapping communication with compute (use more SMs and channels if false)
     bool prefer_overlap_with_compute;
 
+    mutable int dispatch_iteration = 0;
+
     // Some EP hybrid mode settings
     static constexpr int kNumMaxChannelsPerSM = 8;
     static constexpr int kNumMaxSMs = 160;
@@ -212,11 +214,15 @@ public:
             // Hybrid dispatch
             const auto scaleup_recv_buffer = layout::BufferLayout<false>(
                 token_layout, num_scaleup_ranks, num_scaleout_ranks * num_max_tokens_per_rank);
+            const auto scaleout_token_layout = layout::TokenLayout(
+                hidden * elem_size, num_sf_packs * sizeof(sf_pack_t), num_topk, true,
+                nullptr, /*with_scaleout_hdr=*/true);
+            const int scaleout_slots =
+                num_max_tokens_per_rank + kNumMaxChannels * gin_alloc::kScaleoutSlotRoundingReserve;
             const auto scaleout_send_buffer = layout::BufferLayout<false>(
-                token_layout, 1, num_max_tokens_per_rank);
+                scaleout_token_layout, num_scaleout_ranks, scaleout_slots);
             const auto scaleout_recv_buffer = layout::BufferLayout<false>(
-                token_layout, num_scaleout_ranks,
-                /* kNumChannels * kNumMaxTokensPerChannel */ num_max_tokens_per_rank + kNumMaxChannels);
+                scaleout_token_layout, num_scaleout_ranks, scaleout_slots);
             return scaleup_recv_buffer.get_num_bytes() +
                    scaleout_send_buffer.get_num_bytes() +
                    scaleout_recv_buffer.get_num_bytes();
@@ -311,6 +317,7 @@ public:
              const std::optional<torch::Tensor>& cached_token_metadata_at_forward,
              const std::optional<torch::Tensor>& cached_recv_src_metadata,
              const std::optional<torch::Tensor>& cached_channel_linked_list,
+             const std::optional<torch::Tensor>& cached_token_map_at_dispatch,
              const int& num_max_tokens_per_rank,
              const int& num_experts, const int& expert_alignment,
              const int& num_sms, const int& num_qps,
@@ -345,6 +352,7 @@ public:
             if (context->num_scaleout_ranks > 1) {
                 EP_HOST_ASSERT(cached_token_metadata_at_forward.has_value());
                 EP_HOST_ASSERT(cached_channel_linked_list.has_value());
+                EP_HOST_ASSERT(cached_token_map_at_dispatch.has_value());
             }
         }
 
@@ -459,10 +467,31 @@ public:
             num_channels_per_sm = std::min<int>(
                 num_smem_bytes / combine_token_layout.get_num_bytes<true>(),
                 num_channels_per_sm);
+            const int dispatch_buffers_per_channel = prefer_overlap_with_compute
+                ? kNumDispatchSendBuffers + 1
+                : kNumDispatchBuffersPerChannel;
             num_channels_per_sm = std::min<int>(
-                /* 2 kinds of warps */ num_channels_per_sm / 2, kNumMaxChannelsPerSM);
+                num_channels_per_sm / dispatch_buffers_per_channel, kNumMaxChannelsPerSM);
+            // The dispatch kernel carves (send + forward) TMA buffers per channel out of dynamic
+            // shared memory; the budget above must cover the real pool or the launch fails at
+            // higher channel counts.
+            EP_HOST_ASSERT(static_cast<int64_t>(dispatch_buffers_per_channel) * num_channels_per_sm *
+                                   dispatch_token_layout.get_num_bytes<true>() +
+                               get_num_notify_smem_bytes(context->num_ranks, num_experts) <=
+                           num_smem_bytes and
+                           "dispatch TMA pool exceeds the shared-memory budget");
             if (not prefer_overlap_with_compute)
                 num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
+            // Reduce the channel count to fit this launch's GIN indexed-signal budget.
+            // `with_notify` is pinned (not `not cached_mode`) so a cached dispatch derives the
+            // same count the handle was shaped with.
+            if (num_sms > 0 and context->gin_indexed_signals_cnt > 0) {
+                num_channels_per_sm = gin_alloc::constexpr_channels_per_sm(
+                    context->gin_indexed_signals_cnt,
+                    num_sms, num_qps, /*with_notify=*/true, num_channels_per_sm);
+            }
+            EP_HOST_ASSERT(num_channels_per_sm >= 1 and
+                           "shared memory cannot host a single dispatch channel at this token size");
             num_channels = num_sms * num_channels_per_sm;
             if (get_env<int>("EP_BUFFER_DEBUG"))
                 printf("Elastic buffer uses %d channels per SM\n", num_channels_per_sm);
@@ -484,8 +513,9 @@ public:
         }
 
         // Hybrid mode handles
-        std::optional<torch::Tensor> token_metadata_at_forward, channel_linked_list;
+        std::optional<torch::Tensor> token_metadata_at_forward, channel_linked_list, token_map_at_dispatch;
         int *token_metadata_at_forward_ptr = nullptr, *channel_linked_list_ptr = nullptr;
+        int *token_map_at_dispatch_ptr = nullptr;
         if (context->num_scaleout_ranks > 1) {
             // The token destination slot idx during forward
             // `[i, j, k, l]` means: from channel i from scale-out peer k, the j-th token's index in the l-th rank buffer
@@ -551,6 +581,23 @@ public:
                 );
             }
             channel_linked_list_ptr = channel_linked_list->data_ptr<int>();
+
+            // Per-(token, k) recv address map. `[T, k]` records the per-(channel, dst_rank) slot
+            // number that dispatch chose for expert k of my token T. The epilogue derives the full
+            // recv offset as `channel = T % kNumChannels`, `addr = channel * kNumSlotsPerChannel + slot`.
+            if (cached_mode) {
+                token_map_at_dispatch = cached_token_map_at_dispatch;
+                const auto [num_max_tokens_per_rank_, num_topk_] = get_shape<2>(token_map_at_dispatch.value());
+                EP_HOST_ASSERT(num_max_tokens_per_rank == num_max_tokens_per_rank_ and num_topk == num_topk_);
+                EP_HOST_ASSERT(token_map_at_dispatch->is_cuda() and token_map_at_dispatch->is_contiguous());
+                EP_HOST_ASSERT(token_map_at_dispatch->scalar_type() == torch::kInt);
+            } else {
+                token_map_at_dispatch = torch::empty(
+                    {num_max_tokens_per_rank, num_topk},
+                    torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt)
+                );
+            }
+            token_map_at_dispatch_ptr = token_map_at_dispatch->data_ptr<int>();
         }
 
         // Check buffer size
@@ -569,6 +616,8 @@ public:
         std::fill_n(host_workspace_layout.get_scaleup_expert_count_ptr<false>(), num_local_experts, 0);
         std::atomic_thread_fence(std::memory_order_seq_cst);
 
+        ++ dispatch_iteration;
+
         // Do dispatch into the buffers (with SM limitation)
         launch_dispatch(x.data_ptr(), sf_ptr,
                         topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
@@ -578,6 +627,7 @@ public:
                         num_unaligned_recv_tokens_per_expert_ptr,
                         dst_buffer_slot_idx.data_ptr<int>(),
                         token_metadata_at_forward_ptr,
+                        token_map_at_dispatch_ptr,
                         num_tokens, num_max_tokens_per_rank,
                         hidden, x.element_size(),
                         num_sf_packs, sf_token_stride, sf_hidden_stride,
@@ -589,9 +639,13 @@ public:
                         context->num_scaleout_ranks, context->num_scaleup_ranks,
                         context->is_scaleup_nvlink,
                         num_sms, num_channels_per_sm,
+                        context->gin_indexed_signals_cnt,
                         num_smem_bytes,
                         num_qps, context->num_gpu_timeout_cycles,
                         cached_mode, do_cpu_sync,
+                        not prefer_overlap_with_compute,
+                        allow_multiple_reduction, do_expand,
+                        dispatch_iteration,
                         comm_stream);
 
         // For tensor recording
@@ -603,7 +657,8 @@ public:
             num_unaligned_recv_tokens_per_expert,
             dst_buffer_slot_idx,
             token_metadata_at_forward,
-            channel_linked_list};
+            channel_linked_list,
+            token_map_at_dispatch};
 
         // Epilogue can be deferred, so it is a lambda
         auto epilogue = [=, this](const at::cuda::CUDAStream& stream,
@@ -766,7 +821,8 @@ public:
                 recv_src_metadata,
                 dst_buffer_slot_idx,
                 token_metadata_at_forward,
-                channel_linked_list);
+                channel_linked_list,
+                token_map_at_dispatch);
 
             // For non-deferring tensor recording
             if (tensors_to_record_opt.has_value()) {
