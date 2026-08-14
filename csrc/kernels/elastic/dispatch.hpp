@@ -20,6 +20,7 @@
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/launch_runtime.hpp"
+#include "kernel_select.hpp"
 
 namespace deep_ep::elastic {
 
@@ -30,6 +31,9 @@ public:
         bool is_scaleup_nvlink;
         bool do_cpu_sync;
         bool reuse_slot_indices;
+        // Use the ordered (upstream) hybrid kernel instead of the unordered one.
+        // Resolved once from `EP_HYBRID_KERNEL`; only affects the hybrid path.
+        bool use_ordered_kernel;
         // Combine-time reduction mode. Only used by the hybrid kernel to decide how to encode
         // per-(token, k) slot offsets in `token_map_at_dispatch`. Ignored by the direct kernel.
         bool allow_multiple_reduction;
@@ -87,6 +91,18 @@ public:
                 args.num_max_tokens_per_rank,
                 args.num_experts, args.num_topk, args.expert_alignment,
                 args.num_qps, args.num_timeout_cycles);
+        } else if (args.use_ordered_kernel) {
+            header_name = "hybrid_dispatch";
+            func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+                args.do_cpu_sync,
+                args.reuse_slot_indices,
+                args.launch_args.grid_dim.first,
+                args.num_notify_warps, args.num_scaleout_warps, args.num_forward_warps,
+                args.num_scaleout_ranks, args.num_scaleup_ranks,
+                args.num_hidden_bytes, args.num_sf_packs,
+                args.num_max_tokens_per_rank,
+                args.num_experts, args.num_topk, args.expert_alignment,
+                args.num_qps, args.num_timeout_cycles);
         } else {
             header_name = "hybrid_dispatch_unordered";
             func_name = fmt::format("hybrid_unordered_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
@@ -133,6 +149,24 @@ static void __instantiate_kernel() {{
                 args.buffer,
                 args.workspace, args.mapped_host_workspace,
                 args.scaleup_rank_idx));
+        } else if (args.use_ordered_kernel) {
+            EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+                kernel, config,
+                args.x, args.sf, args.topk_idx, args.topk_weights,
+                args.copied_topk_idx,
+                args.cumulative_local_expert_recv_stats,
+                args.psum_num_recv_tokens_per_scaleup_rank,
+                args.psum_num_recv_tokens_per_expert,
+                args.num_unaligned_recv_tokens_per_expert,
+                args.dst_buffer_slot_idx,
+                args.token_metadata_at_forward,
+                args.num_tokens,
+                args.sf_token_stride, args.sf_hidden_stride,
+                args.nccl_dev_comm, args.nccl_window,
+                args.buffer,
+                args.workspace, args.mapped_host_workspace,
+                args.scaleout_rank_idx, args.scaleup_rank_idx
+            ));
         } else {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
                 kernel, config,
@@ -242,6 +276,7 @@ static void launch_dispatch(void* x, void* sf,
         .is_scaleup_nvlink = is_scaleup_nvlink,
         .do_cpu_sync = do_cpu_sync,
         .reuse_slot_indices = reuse_slot_indices,
+        .use_ordered_kernel = use_ordered_hybrid_kernel(),
         .allow_multiple_reduction = allow_multiple_reduction,
         .do_expand = do_expand,
         .double_buffer_forward = double_buffer_forward,

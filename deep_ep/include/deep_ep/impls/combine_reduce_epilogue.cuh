@@ -28,6 +28,9 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk,
           int kNumChannels,
+          // Ordered (upstream) recv layout: partials live at `token_idx` per rank buffer
+          // instead of the unordered per-(channel, slot) map.
+          bool kOrderedLayout = false,
           int kNumThreads = kNumWarps * 32,
           int kNumHiddenBytes = kHidden * sizeof(nv_bfloat16),
           int kNumRanks = kNumScaleoutRanks == 1 ? kNumScaleupRanks : kNumScaleoutRanks,
@@ -56,7 +59,7 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     // Load buffers from scale-out or scale-up ranks
     extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
     const auto comm_token_layout = layout::TokenLayout(kNumHiddenBytes, 0, kNumTopk, false);
-    constexpr int kHybridMode = (kNumScaleoutRanks > 1);
+    constexpr int kHybridMode = (kNumScaleoutRanks > 1) and not kOrderedLayout;
     const auto comm_buffer = layout::BufferLayout<false>(
         comm_token_layout,
         kHybridMode ? kNumScaleoutRanks : kNumTokensInLayout,

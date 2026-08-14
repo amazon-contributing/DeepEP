@@ -21,6 +21,7 @@
 
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
+#include "../elastic/kernel_select.hpp"
 
 #include "api.cuh"
 #include "../../utils/system.hpp"
@@ -107,9 +108,10 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
 
         const bool scaleout_active = num_rdma_ranks > 1;
 
-        // Only hybrid mode uses the shared-context weak-signal GIN configuration;
-        // direct mode keeps the upstream requirements untouched.
-        if (allow_hybrid_mode) {
+        // Only the unordered hybrid kernels use the shared-context weak-signal GIN
+        // configuration; direct mode and the ordered hybrid kernels keep the
+        // upstream requirements untouched.
+        if (allow_hybrid_mode and not elastic::use_ordered_hybrid_kernel()) {
         auto resolve_gin_context_cnt = [&]() -> int {
             const int ctx = (this->num_allocated_qps == 0)
                 ? elastic::gin_alloc::kDefaultGinContextCnt
