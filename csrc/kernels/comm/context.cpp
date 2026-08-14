@@ -1,3 +1,14 @@
+// MIT License
+//
+// Copyright (c) 2025 DeepSeek
+// Changes and additions copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 #include <cstring>
 #include <vector>
 #include <string>
@@ -8,6 +19,7 @@
 #include <nccl.h>
 #include <nccl_device/core.h>
 
+#include <deep_ep/comm/gin_resource_alloc.cuh>
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
 #include <deep_ep/common/math.cuh>
@@ -82,7 +94,8 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
                  const std::optional<int>& sl_idx, const int& num_allocated_qps, const int& qp_depth,
                  const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
                  const bool& enable_lsa_multimem,
-                 const std::shared_ptr<Context>& main_context):
+                 const std::shared_ptr<Context>& main_context,
+                 const bool& unordered_gin_layout):
     rank_idx(rank_idx), num_ranks(num_ranks),
     gin_min_stride(1),
     num_allocated_qps(num_allocated_qps),
@@ -92,7 +105,8 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
     num_rdma_storage_bytes(num_rdma_storage_bytes),
     use_cpu_rdma_storage(use_cpu_rdma_storage) {
     EP_HOST_ASSERT(num_ranks > 0 and num_ranks <= kNumMaxRanks);
-    EP_HOST_ASSERT(num_allocated_qps > 0 and num_allocated_qps <= kNumMaxQPs);
+    // NOTES: 0 is accepted here and means "resolve it in the GIN block below"
+    EP_HOST_ASSERT(num_allocated_qps >= 0 and num_allocated_qps <= kNumMaxQPs);
     EP_HOST_ASSERT(num_workspace_bytes > 0 and num_workspace_bytes % kNumAllocationAlignmentBytes == 0);
     EP_HOST_ASSERT(num_gpu_buffer_bytes >= 0 and num_gpu_buffer_bytes % kNumAllocationAlignmentBytes == 0);
     EP_HOST_ASSERT(num_rdma_storage_bytes >= 0 and num_rdma_storage_bytes % kNumAllocationAlignmentBytes == 0);
@@ -138,6 +152,51 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
 
         // Customized RDMA barrier needs extra signals
         reqs.ginSignalCount = num_ranks + 2 * 2;
+
+        // Only a Context that opts in (EPBuffer in hybrid mode) uses the shared-context
+        // weak-signal GIN configuration; every other buffer and direct mode keep the defaults.
+        if (allow_hybrid_mode and unordered_gin_layout) {
+            const int num_rail_ranks = ncclTeamRail(comm).nRanks;
+            const bool scaleout_active = num_rail_ranks > 1;
+
+            auto resolve_gin_context_cnt = [&]() -> int {
+                const int ctx = num_allocated_qps == 0 ? gin_alloc::kDefaultGinContextCnt
+                                                       : num_allocated_qps;
+                EP_HOST_ASSERT(ctx >= gin_alloc::kMinGinContextCnt and
+                               ctx <= gin_alloc::kMaxGinContextCnt and
+                               "num_allocated_qps must be 0 (auto -> kDefaultGinContextCnt) or "
+                               "within [kMinGinContextCnt, kMaxGinContextCnt]: one GIN context "
+                               "supplies one QP");
+                return ctx;
+            };
+
+            int context_cnt = num_allocated_qps;
+            if (scaleout_active) {
+                context_cnt = resolve_gin_context_cnt();
+                const auto gin_config = gin_alloc::make_gin_resources(context_cnt);
+                gin_indexed_signals_cnt = gin_config.gin_indexed_signals_cnt;
+                EP_HOST_ASSERT(gin_indexed_signals_cnt >= num_rail_ranks - 1 and
+                               "GIN indexed-signal budget cannot give each peer rail team a "
+                               "dedicated signal; reduce num_allocated_qps to raise the "
+                               "per-context signal count");
+                reqs.ginSignalCount = gin_indexed_signals_cnt;
+            } else {
+                gin_indexed_signals_cnt = 0;
+            }
+
+            if (scaleout_active)
+                this->num_allocated_qps = context_cnt;
+            reqs.ginContextCount = context_cnt;
+            reqs.ginExclusiveContexts = false;
+            // The unordered kernels synchronize through counting signals only; VA and
+            // strong signals are not required.
+            reqs.ginVaSignalsRequired = false;
+            reqs.ginStrongSignalsRequired = false;
+
+            if (get_env<int>("EP_BUFFER_DEBUG"))
+                printf("GIN layout: gin_context_cnt=%d, gin_indexed_signals_cnt=%d\n",
+                       context_cnt, gin_indexed_signals_cnt);
+        }
         if (allow_hybrid_mode and num_rdma_storage_bytes > 0) {
             reqs.ginCustomStride = gin_min_stride;
             reqs.ginConnectionType = NCCL_GIN_CONNECTION_CUSTOM_STRIDE;
@@ -153,6 +212,7 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
         if (std::getenv("EP_OVERRIDE_RDMA_SL") != nullptr)
             reqs.ginTrafficClass = get_env<int>("EP_OVERRIDE_RDMA_SL");
     }
+
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
     reqs.useRuntimeVersion = true;
     dev_comm.ptr = malloc(props.devCommRuntimeVersionSize);

@@ -47,6 +47,8 @@ public:
     ncclWindow_t window;
 
     int num_allocated_qps;
+    // Narrowed from V2's `GinResourceConfig`: the launcher only needs the signal count
+    int gin_indexed_signals_cnt = 0;
     int num_cpu_timeout_secs;
     int64_t num_gpu_timeout_cycles;
 
@@ -72,7 +74,8 @@ public:
             const std::optional<int>& sl_idx, const int& num_allocated_qps, const int& qp_depth,
             const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
             const bool& enable_lsa_multimem = false,
-            const std::shared_ptr<Context>& main_context = nullptr);
+            const std::shared_ptr<Context>& main_context = nullptr,
+            const bool& unordered_gin_layout = false);
 
     std::tuple<int, int> get_physical_domain_size() const;
 

@@ -1,5 +1,16 @@
 #pragma once
 
+// MIT License
+//
+// Copyright (c) 2025 DeepSeek
+// Changes and additions copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 #include <c10/util/accumulate.h>
 #include <cuda_runtime.h>
 #include <memory>
@@ -7,6 +18,7 @@
 #include <pybind11/functional.h>
 
 #include <deep_ep/common/compiled.cuh>
+#include <deep_ep/comm/gin_resource_alloc.cuh>
 #include <deep_ep/layout/ep/token.cuh>
 #include <deep_ep/layout/ep/workspace.cuh>
 #include <deep_ep/layout/ep/eplb.cuh>
@@ -74,7 +86,8 @@ public:
             nccl_comm, symmetric::shared_comm_t{}, num_ranks, rank_idx,
             num_workspace_bytes, num_buffer_bytes + num_lb_buffer_bytes, 0, true,
             allow_hybrid_mode, sl_idx, num_allocated_qps,
-            0, num_cpu_timeout_secs, num_gpu_timeout_secs);
+            0, num_cpu_timeout_secs, num_gpu_timeout_secs,
+            false, nullptr, allow_hybrid_mode);
         main_context = context;
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
         context->set_barrier_signals(&workspace.barrier_signals);

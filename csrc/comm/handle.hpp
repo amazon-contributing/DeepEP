@@ -9,6 +9,7 @@ static void register_apis(pybind11::module_& m) {
     pybind11::class_<Context, std::shared_ptr<Context>>(m, "Context")
         .def("get_physical_domain_size", &Context::get_physical_domain_size)
         .def("get_logical_domain_size", &Context::get_logical_domain_size)
+        .def_readonly("num_allocated_qps", &Context::num_allocated_qps)
         .def_readonly("num_workspace_bytes", &Context::num_workspace_bytes)
         .def_readonly("num_gpu_buffer_bytes", &Context::num_gpu_buffer_bytes)
         .def_readonly("num_rdma_storage_bytes", &Context::num_rdma_storage_bytes);

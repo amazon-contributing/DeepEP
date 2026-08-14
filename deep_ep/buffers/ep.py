@@ -1,3 +1,14 @@
+# MIT License
+#
+# Copyright (c) 2025 DeepSeek
+# Changes and additions copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 import functools
 import os
 import math
@@ -280,7 +291,15 @@ class EPBuffer(BufferBase):
             prefer_overlap_with_compute: whether to prefer overlapping communication with compute.
             sl_idx: the optional RDMA service level index. It overrides `EP_DEFAULT_RDMA_SL` and can be overridden by
                 `EP_OVERRIDE_RDMA_SL`.
-            num_allocated_qps: the number of QPs to allocate for RDMA (0 for automatic).
+            num_allocated_qps: the number of QPs to allocate for RDMA. One GIN context supplies
+                one QP, so this is also the GIN context count. Pass 0 for automatic, which
+                resolves per hybrid kernel mode (see `EP_HYBRID_KERNEL`):
+                  - unordered (default): 11 QPs and 21 signals per QP, for the balance
+                    between token batch size and the number of QPs. An explicit value
+                    must be within [2, 17]; anything else is rejected. Requesting fewer
+                    QPs gives each context more signals.
+                  - ordered: 129 QPs. This mode signals through VA/strong signals rather than
+                    the indexed-signal budget.
             num_cpu_timeout_secs: CPU-side timeout in seconds for CPU sync.
             num_gpu_timeout_secs: GPU-side timeout in seconds for GPU operations.
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
@@ -325,14 +344,9 @@ class EPBuffer(BufferBase):
         check_nvlink_connections(group)
 
         # Automatic maximum QP count allowed
-        if num_allocated_qps == 0:
-            # Hybrid mode will consume more QPs
-            # The extra QP is for notify warps
-            if self.allow_hybrid_mode:
-                num_allocated_qps = 65 if check_fast_rdma_atomic_support() else 129
-            else:
-                num_allocated_qps = 17
-        self.num_allocated_qps = num_allocated_qps
+        if num_allocated_qps == 0 and not self.allow_hybrid_mode:
+            # Hybrid mode resolves the QP count in C++ from the GIN signal budget.
+            num_allocated_qps = 17
 
         # Create CPP handle
         super().__init__(explicitly_destroy)
@@ -344,6 +358,8 @@ class EPBuffer(BufferBase):
             num_cpu_timeout_secs, num_gpu_timeout_secs,
             self.explicitly_destroy)
         self.context = self.runtime.context
+
+        self.num_allocated_qps = self.context.num_allocated_qps
 
         # Materialize LB allocation plan
         if lb_allocation_plan is not None:
