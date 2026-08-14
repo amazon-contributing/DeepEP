@@ -1121,6 +1121,7 @@ class ElasticBuffer:
                                  handle.psum_num_recv_tokens_per_scaleup_rank,
                                  handle.token_metadata_at_forward,
                                  handle.channel_linked_list,
+                                 handle.token_map_at_dispatch,
                                  handle.num_experts,
                                  handle.num_max_tokens_per_rank,
                                  num_sms, num_qps,
