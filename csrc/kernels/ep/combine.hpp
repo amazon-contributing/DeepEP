@@ -22,6 +22,7 @@
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
 #include <deep_ep/layout/ep/token.cuh>
+#include <deep_ep/impls/ep/proxy_ring.cuh>
 
 #include "../../runtime/jit.hpp"
 
@@ -38,9 +39,11 @@ static void* launch_combine(void* x,
                             int* psum_num_recv_tokens_per_scaleup_rank,
                             int* token_metadata_at_forward,
                             int* channel_linked_list,
+                            int* token_map_at_dispatch,
                             const deep_jit::NoRefPtr& nccl_dev_comm, const ncclWindow_t& nccl_window,
                             void* buffer, void* workspace,
-                            const int& num_reduced_tokens, const int& num_max_tokens_per_rank,
+                            const int& num_reduced_tokens, const int& num_combined_tokens,
+                            const int& num_max_tokens_per_rank,
                             const int& hidden,
                             const int& num_experts, const int& num_topk,
                             const int& num_qps, const int64_t& num_timeout_cycles,
@@ -63,9 +66,23 @@ static void* launch_combine(void* x,
         EP_HOST_ASSERT(num_channels / num_sms <= 16);
 
         num_scaleup_warps = num_forward_warps = num_channels / num_sms;
-        num_warps = num_scaleup_warps + num_forward_warps;
-        EP_HOST_ASSERT(num_warps * token_layout.get_num_bytes<true>() <= num_smem_bytes and
-                       "Invalid combine SM count, please try to match your dispatch config");
+
+        const auto num_data_warps = num_scaleup_warps + num_forward_warps;
+        num_warps = num_data_warps + 1;
+        EP_HOST_ASSERT(num_warps * 32 <= 1024 and
+                       "combine warp count (scale-up + forward + proxy) exceeds the "
+                       "1024-thread block limit; use at least num_channels / 15 SMs");
+
+        // TMA buffers and the proxy hand-off rings both live in the dynamic shmem arena; the
+        // rings are placed after the TMA region (see hybrid_combine_unordered.cuh) so no
+        // alignment pad is needed. Bound by the same total the channel auto-tuner sized against.
+        const int64_t tma_smem_bytes =
+            static_cast<int64_t>(num_data_warps) * token_layout.get_num_bytes<true>();
+        const int64_t proxy_ring_bytes =
+            ProxyRingLayout::get_num_bytes(num_forward_warps, kProxyRingDepthDefault);
+        // The channel auto-tuner should prevent this assert from firing; leaving it as a sanity check.
+        EP_HOST_ASSERT(tma_smem_bytes + proxy_ring_bytes <= num_smem_bytes and
+                       "Combine TMA buffers + proxy rings exceed per-block shared memory");
     }
 
     const auto num_threads = num_warps * 32;
@@ -134,10 +151,12 @@ static void __instantiate_kernel() {{
             psum_num_recv_tokens_per_scaleup_rank,
             token_metadata_at_forward,
             channel_linked_list,
+            token_map_at_dispatch,
             nccl_dev_comm, nccl_window,
             buffer, workspace,
             scaleout_rank_idx, scaleup_rank_idx,
-            num_reduced_tokens
+            num_reduced_tokens,
+            num_combined_tokens
         );
     }
 
@@ -162,8 +181,10 @@ static void launch_combine_reduce_epilogue(void* combined_x,
                                            const int& num_combined_tokens, const int& num_max_tokens_per_rank,
                                            const int& hidden,
                                            const int& num_experts, const int& num_topk,
+                                           const int& num_channels,
                                            void* reduce_buffer,
                                            void* bias_0, void* bias_1,
+                                           int* token_map_at_dispatch,
                                            const int& num_scaleout_ranks, const int& num_scaleup_ranks,
                                            const int& scaleout_rank_idx, const int& scaleup_rank_idx,
                                            const int& num_sms, const int& num_smem_bytes,
@@ -180,14 +201,15 @@ static void launch_combine_reduce_epilogue(void* combined_x,
 #include <deep_ep/impls/ep/combine_reduce_epilogue.cuh>
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&deep_ep::ep::combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&deep_ep::ep::combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )", use_expanded_layout, allow_multiple_reduction,
         num_sms, num_threads / 32,
         num_scaleout_ranks, num_scaleup_ranks,
         hidden,
         num_max_tokens_per_rank,
-        num_experts, num_topk));
+        num_experts, num_topk,
+        num_channels));
 
     // Launch
     jit->launch(
@@ -203,6 +225,7 @@ static void __instantiate_kernel() {{
         combined_topk_idx,
         reduce_buffer,
         bias_0, bias_1,
+        token_map_at_dispatch,
         num_combined_tokens,
         scaleout_rank_idx, scaleup_rank_idx
     );

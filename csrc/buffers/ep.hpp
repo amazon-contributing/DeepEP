@@ -22,6 +22,7 @@
 #include <deep_ep/layout/ep/token.cuh>
 #include <deep_ep/layout/ep/workspace.cuh>
 #include <deep_ep/layout/ep/eplb.cuh>
+#include <deep_ep/impls/ep/proxy_ring.cuh>
 
 #include "base.hpp"
 #include "../comm/api.hpp"
@@ -250,15 +251,14 @@ public:
         } else {
             // Hybrid combine
             const int num_tokens_in_scaleup_layout = allow_multiple_reduction ? std::min(num_scaleup_ranks, num_topk) : num_topk;
-            const int num_tokens_in_scaleout_layout = allow_multiple_reduction ? std::min(num_scaleout_ranks, num_topk) : num_topk;
             const auto scaleup_recv_buffer = layout::BufferLayout<false>(
                 token_layout, num_tokens_in_scaleup_layout, num_scaleout_ranks * num_max_tokens_per_rank);
             const auto scaleout_recv_buffer = layout::BufferLayout<false>(
-                token_layout, num_tokens_in_scaleout_layout, num_max_tokens_per_rank);
+                token_layout, num_scaleout_ranks,
+                (num_max_tokens_per_rank + kNumMaxChannels) * (allow_multiple_reduction ? 1 : num_topk));
             const auto scaleout_send_buffer = layout::BufferLayout<false>(
-                token_layout, allow_multiple_reduction ? 1 : num_topk,
-                /* kNumChannels * num_scaleout_ranks * kNumMaxTokensPerChannel */
-                num_scaleout_ranks * (num_max_tokens_per_rank + kNumMaxChannels));
+                token_layout, num_scaleout_ranks,
+                (num_max_tokens_per_rank + kNumMaxChannels) * (allow_multiple_reduction ? 1 : num_topk));
             return scaleup_recv_buffer.get_num_bytes() +
                    scaleout_send_buffer.get_num_bytes() +
                    scaleout_recv_buffer.get_num_bytes();
@@ -490,6 +490,16 @@ public:
                     context->gin_indexed_signals_cnt,
                     num_sms, num_qps, /*with_notify=*/true, num_channels_per_sm);
             }
+            // The unordered combine also carves the proxy hand-off rings out of the
+            // same dynamic shared memory as its TMA buffers; shrink the channel count
+            // until both fit (see the matching assert in `launch_combine`).
+            while (num_channels_per_sm > 1 and
+                   static_cast<int64_t>(2 * num_channels_per_sm) *
+                           combine_token_layout.get_num_bytes<true, int64_t>() +
+                       ProxyRingLayout::get_num_bytes(num_channels_per_sm,
+                                                      kProxyRingDepthDefault) >
+                   num_smem_bytes)
+                -- num_channels_per_sm;
             EP_HOST_ASSERT(num_channels_per_sm >= 1 and
                            "shared memory cannot host a single dispatch channel at this token size");
             num_channels = num_sms * num_channels_per_sm;
@@ -865,6 +875,7 @@ public:
             const torch::Tensor& psum_num_recv_tokens_per_scaleup_rank,
             const std::optional<torch::Tensor>& token_metadata_at_forward,
             const std::optional<torch::Tensor>& channel_linked_list,
+            const std::optional<torch::Tensor>& token_map_at_dispatch,
             const int& num_experts,
             const int& num_max_tokens_per_rank,
             const int& num_sms, const int& num_qps,
@@ -940,6 +951,7 @@ public:
         int num_channels = 1;
         int* token_metadata_at_forward_ptr = nullptr;
         int* channel_linked_list_ptr = nullptr;
+        int* token_map_at_dispatch_ptr = nullptr;
         if (context->num_scaleout_ranks > 1) {
             // The token metadata during forward
             const auto [num_channels_, d1, d2] = get_shape<3>(token_metadata_at_forward.value());
@@ -959,6 +971,14 @@ public:
             EP_HOST_ASSERT(d2_ == context->num_scaleup_ranks);
             EP_HOST_ASSERT(channel_linked_list->is_cuda() and channel_linked_list->is_contiguous());
             EP_HOST_ASSERT(channel_linked_list->scalar_type() == torch::kInt);
+
+            // Per-(token, k) recv address map — consumed by the epilogue.
+            EP_HOST_ASSERT(token_map_at_dispatch.has_value());
+            const auto [num_max_tokens_per_rank_, num_topk_] = get_shape<2>(token_map_at_dispatch.value());
+            EP_HOST_ASSERT(num_max_tokens_per_rank == num_max_tokens_per_rank_ and num_topk == num_topk_);
+            EP_HOST_ASSERT(token_map_at_dispatch->is_cuda() and token_map_at_dispatch->is_contiguous());
+            EP_HOST_ASSERT(token_map_at_dispatch->scalar_type() == torch::kInt);
+            token_map_at_dispatch_ptr = token_map_at_dispatch->data_ptr<int>();
         }
 
         // Push data into remote buffers
@@ -970,9 +990,11 @@ public:
             psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
             token_metadata_at_forward_ptr,
             channel_linked_list_ptr,
+            token_map_at_dispatch_ptr,
             context->dev_comm, context->window,
             context->buffer, context->workspace,
-            num_reduced_tokens, num_max_tokens_per_rank,
+            num_reduced_tokens, num_combined_tokens,
+            num_max_tokens_per_rank,
             hidden, num_experts, num_topk,
             num_qps, context->num_gpu_timeout_cycles,
             context->num_scaleout_ranks, context->num_scaleup_ranks,
@@ -988,7 +1010,7 @@ public:
             x, topk_weights, bias_0, bias_1,
             src_metadata, combined_topk_idx,
             psum_num_recv_tokens_per_scaleup_rank,
-            token_metadata_at_forward, channel_linked_list};
+            token_metadata_at_forward, channel_linked_list, token_map_at_dispatch};
 
         // Epilogue can be deferred, so it is a lambda
         auto epilogue = [=, this](const at::cuda::CUDAStream& stream,
@@ -1015,8 +1037,10 @@ public:
                                            num_combined_tokens, num_max_tokens_per_rank,
                                            hidden,
                                            num_experts, num_topk,
+                                           num_channels,
                                            reduce_buffer,
                                            bias_ptrs[0], bias_ptrs[1],
+                                           token_map_at_dispatch_ptr,
                                            context->num_scaleout_ranks, context->num_scaleup_ranks,
                                            context->scaleout_rank_idx, context->scaleup_rank_idx,
                                            jit->device.get_num_sms(),
