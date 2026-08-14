@@ -64,6 +64,9 @@ class EPHandle:
         dst_buffer_slot_idx: destination buffer slot indices from dispatch.
         token_metadata_at_forward: per-channel forwarded token metadata (hybrid mode only).
         channel_linked_list: per-channel per-scaleup-peer linked list (hybrid mode only).
+        token_map_at_dispatch: per-(token, k) recv slot for combine's return trip, `[num_max_tokens_per_rank, num_topk]`
+            (hybrid mode only). Populated by dispatch; consumed by the combine epilogue to look up
+            each partial's location under the queue-based recv layout.
         num_recv_tokens: the total number of received tokens.
     """
 
@@ -82,7 +85,8 @@ class EPHandle:
                  recv_src_metadata: torch.Tensor,
                  dst_buffer_slot_idx: torch.Tensor,
                  token_metadata_at_forward: Optional[torch.Tensor],
-                 channel_linked_list: Optional[torch.Tensor]):
+                 channel_linked_list: Optional[torch.Tensor],
+                 token_map_at_dispatch: Optional[torch.Tensor]):
         # NOTES: remember to copy the original users' input to prevent uncasual modifications on them
         assert topk_idx is not None
 
@@ -100,6 +104,7 @@ class EPHandle:
         self.dst_buffer_slot_idx = dst_buffer_slot_idx
         self.token_metadata_at_forward = token_metadata_at_forward
         self.channel_linked_list = channel_linked_list
+        self.token_map_at_dispatch = token_map_at_dispatch
 
         # May not be accurate without CPU sync
         self.num_recv_tokens = num_recv_tokens
@@ -527,9 +532,9 @@ class ElasticBuffer:
         -> Tuple[Optional[int], Optional[int], Optional[list],
                  Optional[torch.Tensor], Optional[torch.Tensor],
                  Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor],
-                 Optional[torch.Tensor], Optional[torch.Tensor]]:
+                 Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         if handle is None:
-            return None, None, None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None, None, None, None
         return (handle.num_recv_tokens,
                 handle.num_expanded_tokens,
                 handle.num_recv_tokens_per_expert_list,
@@ -539,7 +544,8 @@ class ElasticBuffer:
                 handle.dst_buffer_slot_idx,
                 handle.token_metadata_at_forward,
                 handle.recv_src_metadata,
-                handle.channel_linked_list)
+                handle.channel_linked_list,
+                handle.token_map_at_dispatch)
 
     @staticmethod
     def capture() -> EventHandle:
@@ -968,7 +974,8 @@ class ElasticBuffer:
          cached_dst_buffer_slot_idx,
          cached_token_metadata_at_forward,
          cached_recv_src_metadata,
-         cached_channel_linked_list) = self._unpack_handle(handle)
+         cached_channel_linked_list,
+         cached_token_map_at_dispatch) = self._unpack_handle(handle)
 
         # Some default values
         num_max_tokens_per_rank = value_or(num_max_tokens_per_rank, self.num_max_tokens_per_rank)
@@ -988,6 +995,7 @@ class ElasticBuffer:
          dst_buffer_slot_idx,
          token_metadata_at_forward,
          channel_linked_list,
+         token_map_at_dispatch,
          event) = self.runtime.dispatch(x, sf, topk_idx, topk_weights,
                                         cumulative_local_expert_recv_stats,
                                         cached_num_recv_tokens,
@@ -1000,6 +1008,7 @@ class ElasticBuffer:
                                         cached_token_metadata_at_forward,
                                         cached_recv_src_metadata,
                                         cached_channel_linked_list,
+                                        cached_token_map_at_dispatch,
                                         num_max_tokens_per_rank,
                                         num_experts, expert_alignment,
                                         num_sms, num_qps,
@@ -1026,7 +1035,8 @@ class ElasticBuffer:
                               recv_src_metadata,
                               dst_buffer_slot_idx,
                               token_metadata_at_forward,
-                              channel_linked_list)
+                              channel_linked_list,
+                              token_map_at_dispatch)
 
         # Create event
         event_overlap = EventOverlap(event)
