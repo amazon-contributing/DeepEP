@@ -25,6 +25,7 @@
 #include <deep_ep/layout/ep/token.cuh>
 
 #include "../../runtime/jit.hpp"
+#include "kernel_select.hpp"
 
 namespace deep_ep::ep {
 
@@ -122,6 +123,18 @@ static void launch_dispatch(void* x, void* sf,
             num_max_tokens_per_rank,
             num_experts, num_topk, expert_alignment,
             num_qps, num_timeout_cycles);
+    } else if (use_ordered_hybrid_kernel()) {
+        header_name = "hybrid_dispatch";
+        func_name = std::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            do_cpu_sync,
+            reuse_slot_indices,
+            num_sms,
+            num_notify_warps, num_scaleout_warps, num_forward_warps,
+            num_scaleout_ranks, num_scaleup_ranks,
+            hidden * elem_size, num_sf_packs,
+            num_max_tokens_per_rank,
+            num_experts, num_topk, expert_alignment,
+            num_qps, num_timeout_cycles);
     } else {
         header_name = "hybrid_dispatch_unordered";
         func_name = std::format("hybrid_unordered_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
@@ -171,6 +184,23 @@ static void __instantiate_kernel() {{
             buffer,
             workspace, mapped_host_workspace,
             scaleup_rank_idx
+        );
+    } else if (use_ordered_hybrid_kernel()) {
+        jit->launch(
+            kernel, options,
+            x, static_cast<sf_pack_t*>(sf), topk_idx, topk_weights,
+            cumulative_local_expert_recv_stats,
+            psum_num_recv_tokens_per_scaleup_rank,
+            psum_num_recv_tokens_per_expert,
+            num_unaligned_recv_tokens_per_expert,
+            dst_buffer_slot_idx,
+            token_metadata_at_forward,
+            num_tokens,
+            sf_token_stride, sf_hidden_stride,
+            nccl_dev_comm, nccl_window,
+            buffer,
+            workspace, mapped_host_workspace,
+            scaleout_rank_idx, scaleup_rank_idx
         );
     } else {
         jit->launch(

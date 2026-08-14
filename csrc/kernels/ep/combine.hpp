@@ -25,6 +25,7 @@
 #include <deep_ep/impls/ep/proxy_ring.cuh>
 
 #include "../../runtime/jit.hpp"
+#include "kernel_select.hpp"
 
 namespace deep_ep::ep {
 
@@ -67,22 +68,29 @@ static void* launch_combine(void* x,
 
         num_scaleup_warps = num_forward_warps = num_channels / num_sms;
 
-        const auto num_data_warps = num_scaleup_warps + num_forward_warps;
-        num_warps = num_data_warps + 1;
-        EP_HOST_ASSERT(num_warps * 32 <= 1024 and
-                       "combine warp count (scale-up + forward + proxy) exceeds the "
-                       "1024-thread block limit; use at least num_channels / 15 SMs");
+        if (use_ordered_hybrid_kernel()) {
+            // The ordered kernel has no proxy warp and only carves TMA buffers out of shmem.
+            num_warps = num_scaleup_warps + num_forward_warps;
+            EP_HOST_ASSERT(num_warps * token_layout.get_num_bytes<true>() <= num_smem_bytes and
+                           "Invalid combine SM count, please try to match your dispatch config");
+        } else {
+            const auto num_data_warps = num_scaleup_warps + num_forward_warps;
+            num_warps = num_data_warps + 1;
+            EP_HOST_ASSERT(num_warps * 32 <= 1024 and
+                           "combine warp count (scale-up + forward + proxy) exceeds the "
+                           "1024-thread block limit; use at least num_channels / 15 SMs");
 
-        // TMA buffers and the proxy hand-off rings both live in the dynamic shmem arena; the
-        // rings are placed after the TMA region (see hybrid_combine_unordered.cuh) so no
-        // alignment pad is needed. Bound by the same total the channel auto-tuner sized against.
-        const int64_t tma_smem_bytes =
-            static_cast<int64_t>(num_data_warps) * token_layout.get_num_bytes<true>();
-        const int64_t proxy_ring_bytes =
-            ProxyRingLayout::get_num_bytes(num_forward_warps, kProxyRingDepthDefault);
-        // The channel auto-tuner should prevent this assert from firing; leaving it as a sanity check.
-        EP_HOST_ASSERT(tma_smem_bytes + proxy_ring_bytes <= num_smem_bytes and
-                       "Combine TMA buffers + proxy rings exceed per-block shared memory");
+            // TMA buffers and the proxy hand-off rings both live in the dynamic shmem arena; the
+            // rings are placed after the TMA region (see hybrid_combine_unordered.cuh) so no
+            // alignment pad is needed. Bound by the same total the channel auto-tuner sized against.
+            const int64_t tma_smem_bytes =
+                static_cast<int64_t>(num_data_warps) * token_layout.get_num_bytes<true>();
+            const int64_t proxy_ring_bytes =
+                ProxyRingLayout::get_num_bytes(num_forward_warps, kProxyRingDepthDefault);
+            // The channel auto-tuner should prevent this assert from firing; leaving it as a sanity check.
+            EP_HOST_ASSERT(tma_smem_bytes + proxy_ring_bytes <= num_smem_bytes and
+                           "Combine TMA buffers + proxy rings exceed per-block shared memory");
+        }
     }
 
     const auto num_threads = num_warps * 32;
@@ -103,8 +111,10 @@ static void* launch_combine(void* x,
                                 num_topk,
                                 num_qps, num_timeout_cycles);
     } else {
-        header_name = "hybrid_combine_unordered";
-        func_name = std::format("hybrid_unordered_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+        header_name = use_ordered_hybrid_kernel() ? "hybrid_combine" : "hybrid_combine_unordered";
+        func_name = std::format("{}<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+                                use_ordered_hybrid_kernel() ? "hybrid_combine_impl"
+                                                            : "hybrid_unordered_combine_impl",
                                 use_expanded_layout, allow_multiple_reduction,
                                 num_sms,
                                 num_scaleup_warps, num_forward_warps,
@@ -141,6 +151,19 @@ static void __instantiate_kernel() {{
             nccl_dev_comm, nccl_window,
             buffer, workspace,
             scaleup_rank_idx,
+            num_reduced_tokens
+        );
+    } else if (use_ordered_hybrid_kernel()) {
+        jit->launch(
+            kernel, options,
+            static_cast<nv_bfloat16*>(x), static_cast<float*>(topk_weights),
+            src_metadata,
+            psum_num_recv_tokens_per_scaleup_rank,
+            token_metadata_at_forward,
+            channel_linked_list,
+            nccl_dev_comm, nccl_window,
+            buffer, workspace,
+            scaleout_rank_idx, scaleup_rank_idx,
             num_reduced_tokens
         );
     } else {
@@ -201,7 +224,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
 #include <deep_ep/impls/ep/combine_reduce_epilogue.cuh>
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&deep_ep::ep::combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&deep_ep::ep::combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )", use_expanded_layout, allow_multiple_reduction,
         num_sms, num_threads / 32,
@@ -209,7 +232,8 @@ static void __instantiate_kernel() {{
         hidden,
         num_max_tokens_per_rank,
         num_experts, num_topk,
-        num_channels));
+        num_channels,
+        use_ordered_hybrid_kernel()));
 
     // Launch
     jit->launch(

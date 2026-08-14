@@ -27,6 +27,7 @@
 #include "base.hpp"
 #include "../comm/api.hpp"
 #include "../kernels/ep/api.hpp"
+#include "../kernels/ep/kernel_select.hpp"
 #include "../runtime/jit.hpp"
 #include "../utils/event.hpp"
 #include "../utils/tensor.hpp"
@@ -90,7 +91,7 @@ public:
             num_workspace_bytes, num_buffer_bytes + num_lb_buffer_bytes, 0, true,
             allow_hybrid_mode, sl_idx, num_allocated_qps,
             0, num_cpu_timeout_secs, num_gpu_timeout_secs,
-            false, nullptr, allow_hybrid_mode);
+            false, nullptr, allow_hybrid_mode and not use_ordered_hybrid_kernel());
         main_context = context;
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
         context->set_barrier_signals(&workspace.barrier_signals);
@@ -215,6 +216,18 @@ public:
             // Hybrid dispatch
             const auto scaleup_recv_buffer = layout::BufferLayout<false>(
                 token_layout, num_scaleup_ranks, num_scaleout_ranks * num_max_tokens_per_rank);
+            if (use_ordered_hybrid_kernel()) {
+                // The ordered kernel keeps upstream's send/recv shapes: a single token-indexed
+                // send buffer and header-less recv slots.
+                const auto scaleout_send_buffer = layout::BufferLayout<false>(
+                    token_layout, 1, num_max_tokens_per_rank);
+                const auto scaleout_recv_buffer = layout::BufferLayout<false>(
+                    token_layout, num_scaleout_ranks,
+                    /* kNumChannels * kNumMaxTokensPerChannel */ num_max_tokens_per_rank + kNumMaxChannels);
+                return scaleup_recv_buffer.get_num_bytes() +
+                       scaleout_send_buffer.get_num_bytes() +
+                       scaleout_recv_buffer.get_num_bytes();
+            }
             const auto scaleout_token_layout = layout::TokenLayout(
                 hidden * elem_size, num_sf_packs * sizeof(sf_pack_t), num_topk, true,
                 nullptr, /*with_scaleout_hdr=*/true);
@@ -253,6 +266,19 @@ public:
             const int num_tokens_in_scaleup_layout = allow_multiple_reduction ? std::min(num_scaleup_ranks, num_topk) : num_topk;
             const auto scaleup_recv_buffer = layout::BufferLayout<false>(
                 token_layout, num_tokens_in_scaleup_layout, num_scaleout_ranks * num_max_tokens_per_rank);
+            if (use_ordered_hybrid_kernel()) {
+                // The ordered kernel keeps upstream's token-indexed return layout.
+                const int num_tokens_in_scaleout_layout = allow_multiple_reduction ? std::min(num_scaleout_ranks, num_topk) : num_topk;
+                const auto scaleout_recv_buffer = layout::BufferLayout<false>(
+                    token_layout, num_tokens_in_scaleout_layout, num_max_tokens_per_rank);
+                const auto scaleout_send_buffer = layout::BufferLayout<false>(
+                    token_layout, allow_multiple_reduction ? 1 : num_topk,
+                    /* kNumChannels * num_scaleout_ranks * kNumMaxTokensPerChannel */
+                    num_scaleout_ranks * (num_max_tokens_per_rank + kNumMaxChannels));
+                return scaleup_recv_buffer.get_num_bytes() +
+                       scaleout_send_buffer.get_num_bytes() +
+                       scaleout_recv_buffer.get_num_bytes();
+            }
             const auto scaleout_recv_buffer = layout::BufferLayout<false>(
                 token_layout, num_scaleout_ranks,
                 (num_max_tokens_per_rank + kNumMaxChannels) * (allow_multiple_reduction ? 1 : num_topk));
@@ -352,7 +378,8 @@ public:
             if (context->num_scaleout_ranks > 1) {
                 EP_HOST_ASSERT(cached_token_metadata_at_forward.has_value());
                 EP_HOST_ASSERT(cached_channel_linked_list.has_value());
-                EP_HOST_ASSERT(cached_token_map_at_dispatch.has_value());
+                if (not use_ordered_hybrid_kernel())
+                    EP_HOST_ASSERT(cached_token_map_at_dispatch.has_value());
             }
         }
 
@@ -467,6 +494,14 @@ public:
             num_channels_per_sm = std::min<int>(
                 num_smem_bytes / combine_token_layout.get_num_bytes<true>(),
                 num_channels_per_sm);
+            if (use_ordered_hybrid_kernel()) {
+                // The ordered kernel carves one send + one forward TMA buffer per channel and has
+                // no per-channel signal budget, so keep the upstream channel decision.
+                num_channels_per_sm = std::min<int>(
+                    /* 2 kinds of warps */ num_channels_per_sm / 2, kNumMaxChannelsPerSM);
+                if (not prefer_overlap_with_compute)
+                    num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
+            } else {
             const int dispatch_buffers_per_channel = prefer_overlap_with_compute
                 ? kNumDispatchSendBuffers + 1
                 : kNumDispatchBuffersPerChannel;
@@ -502,6 +537,7 @@ public:
                 -- num_channels_per_sm;
             EP_HOST_ASSERT(num_channels_per_sm >= 1 and
                            "shared memory cannot host a single dispatch channel at this token size");
+            }
             num_channels = num_sms * num_channels_per_sm;
             if (get_env<int>("EP_BUFFER_DEBUG"))
                 printf("Elastic buffer uses %d channels per SM\n", num_channels_per_sm);
@@ -595,19 +631,21 @@ public:
             // Per-(token, k) recv address map. `[T, k]` records the per-(channel, dst_rank) slot
             // number that dispatch chose for expert k of my token T. The epilogue derives the full
             // recv offset as `channel = T % kNumChannels`, `addr = channel * kNumSlotsPerChannel + slot`.
-            if (cached_mode) {
-                token_map_at_dispatch = cached_token_map_at_dispatch;
-                const auto [num_max_tokens_per_rank_, num_topk_] = get_shape<2>(token_map_at_dispatch.value());
-                EP_HOST_ASSERT(num_max_tokens_per_rank == num_max_tokens_per_rank_ and num_topk == num_topk_);
-                EP_HOST_ASSERT(token_map_at_dispatch->is_cuda() and token_map_at_dispatch->is_contiguous());
-                EP_HOST_ASSERT(token_map_at_dispatch->scalar_type() == torch::kInt);
-            } else {
-                token_map_at_dispatch = torch::empty(
-                    {num_max_tokens_per_rank, num_topk},
-                    torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt)
-                );
+            if (not use_ordered_hybrid_kernel()) {
+                if (cached_mode) {
+                    token_map_at_dispatch = cached_token_map_at_dispatch;
+                    const auto [num_max_tokens_per_rank_, num_topk_] = get_shape<2>(token_map_at_dispatch.value());
+                    EP_HOST_ASSERT(num_max_tokens_per_rank == num_max_tokens_per_rank_ and num_topk == num_topk_);
+                    EP_HOST_ASSERT(token_map_at_dispatch->is_cuda() and token_map_at_dispatch->is_contiguous());
+                    EP_HOST_ASSERT(token_map_at_dispatch->scalar_type() == torch::kInt);
+                } else {
+                    token_map_at_dispatch = torch::empty(
+                        {num_max_tokens_per_rank, num_topk},
+                        torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt)
+                    );
+                }
+                token_map_at_dispatch_ptr = token_map_at_dispatch->data_ptr<int>();
             }
-            token_map_at_dispatch_ptr = token_map_at_dispatch->data_ptr<int>();
         }
 
         // Check buffer size
@@ -973,12 +1011,14 @@ public:
             EP_HOST_ASSERT(channel_linked_list->scalar_type() == torch::kInt);
 
             // Per-(token, k) recv address map — consumed by the epilogue.
-            EP_HOST_ASSERT(token_map_at_dispatch.has_value());
-            const auto [num_max_tokens_per_rank_, num_topk_] = get_shape<2>(token_map_at_dispatch.value());
-            EP_HOST_ASSERT(num_max_tokens_per_rank == num_max_tokens_per_rank_ and num_topk == num_topk_);
-            EP_HOST_ASSERT(token_map_at_dispatch->is_cuda() and token_map_at_dispatch->is_contiguous());
-            EP_HOST_ASSERT(token_map_at_dispatch->scalar_type() == torch::kInt);
-            token_map_at_dispatch_ptr = token_map_at_dispatch->data_ptr<int>();
+            if (not use_ordered_hybrid_kernel()) {
+                EP_HOST_ASSERT(token_map_at_dispatch.has_value());
+                const auto [num_max_tokens_per_rank_, num_topk_] = get_shape<2>(token_map_at_dispatch.value());
+                EP_HOST_ASSERT(num_max_tokens_per_rank == num_max_tokens_per_rank_ and num_topk == num_topk_);
+                EP_HOST_ASSERT(token_map_at_dispatch->is_cuda() and token_map_at_dispatch->is_contiguous());
+                EP_HOST_ASSERT(token_map_at_dispatch->scalar_type() == torch::kInt);
+                token_map_at_dispatch_ptr = token_map_at_dispatch->data_ptr<int>();
+            }
         }
 
         // Push data into remote buffers

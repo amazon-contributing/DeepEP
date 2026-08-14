@@ -153,8 +153,9 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
         // Customized RDMA barrier needs extra signals
         reqs.ginSignalCount = num_ranks + 2 * 2;
 
-        // Only a Context that opts in (EPBuffer in hybrid mode) uses the shared-context
-        // weak-signal GIN configuration; every other buffer and direct mode keep the defaults.
+        // Only a Context that opts in (EPBuffer running the unordered hybrid kernels) uses the
+        // shared-context weak-signal GIN configuration; every other buffer, direct mode and
+        // the ordered hybrid kernels keep NCCL's default requirements.
         if (allow_hybrid_mode and unordered_gin_layout) {
             const int num_rail_ranks = ncclTeamRail(comm).nRanks;
             const bool scaleout_active = num_rail_ranks > 1;
