@@ -64,8 +64,8 @@ public:
                 args.num_experts, args.num_topk, args.expert_alignment,
                 args.num_qps, args.num_timeout_cycles);
         } else {
-            header_name = "hybrid_dispatch";
-            func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            header_name = "hybrid_dispatch_unordered";
+            func_name = fmt::format("hybrid_unordered_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
                 args.launch_args.grid_dim.first,

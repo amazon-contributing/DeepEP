@@ -1,11 +1,23 @@
 #pragma once
 
+// MIT License
+//
+// Copyright (c) 2025 DeepSeek
+// Changes and additions copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 #include <cuda_runtime.h>
 #include <memory>
 #include <numeric>
 #include <vector>
 #include <pybind11/functional.h>
 
+#include <deep_ep/common/gin_resource_alloc.cuh>
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/compiled.cuh>
 
@@ -171,6 +183,10 @@ public:
 
     std::tuple<int, int> get_physical_domain_size() const {
         return {nccl_context->num_rdma_ranks, nccl_context->num_nvl_ranks};
+    }
+
+    int get_num_allocated_qps() const {
+        return nccl_context->num_allocated_qps;
     }
 
     std::tuple<int, int> get_logical_domain_size() const {
@@ -1349,6 +1365,7 @@ static void register_apis(pybind11::module_& m) {
         .def("destroy", &ElasticBuffer::destroy)
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)
+        .def("get_num_allocated_qps", &ElasticBuffer::get_num_allocated_qps)
         .def("get_logical_domain_size", &ElasticBuffer::get_logical_domain_size)
         .def("barrier", &ElasticBuffer::barrier)
         .def("engram_write", &ElasticBuffer::engram_write)

@@ -58,8 +58,8 @@ public:
                                     args.num_topk,
                                     args.num_qps, args.num_timeout_cycles);
         } else {
-            header_name = "hybrid_combine";
-            func_name = fmt::format("hybrid_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            header_name = "hybrid_combine_unordered";
+            func_name = fmt::format("hybrid_unordered_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                                     args.use_expanded_layout, args.allow_multiple_reduction,
                                     args.launch_args.grid_dim.first,
                                     args.num_scaleup_warps, args.num_forward_warps,
