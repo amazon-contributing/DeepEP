@@ -19,6 +19,7 @@
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/launch_runtime.hpp"
+#include "kernel_select.hpp"
 
 namespace deep_ep::elastic {
 
@@ -28,6 +29,9 @@ public:
         // Templated arguments
         bool is_scaleup_nvlink;
         bool use_expanded_layout, allow_multiple_reduction;
+        // Use the ordered (upstream) hybrid kernel instead of the unordered one.
+        // Resolved once from `EP_HYBRID_KERNEL`; only affects the hybrid path.
+        bool use_ordered_kernel;
         int num_scaleup_warps, num_forward_warps;
         int num_scaleout_ranks, num_scaleup_ranks;
         int hidden;
@@ -72,8 +76,9 @@ public:
                                     args.num_topk,
                                     args.num_qps, args.num_timeout_cycles);
         } else {
-            header_name = "hybrid_combine_unordered";
-            func_name = fmt::format("hybrid_unordered_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            header_name = args.use_ordered_kernel ? "hybrid_combine" : "hybrid_combine_unordered";
+            func_name = fmt::format("{}<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+                                    args.use_ordered_kernel ? "hybrid_combine_impl" : "hybrid_unordered_combine_impl",
                                     args.use_expanded_layout, args.allow_multiple_reduction,
                                     args.launch_args.grid_dim.first,
                                     args.num_scaleup_warps, args.num_forward_warps,
@@ -104,6 +109,17 @@ static void __instantiate_kernel() {{
                                                      args.nccl_dev_comm, args.nccl_window,
                                                      args.buffer, args.workspace,
                                                      args.scaleup_rank_idx,
+                                                     args.num_reduced_tokens));
+        } else if (args.use_ordered_kernel) {
+            EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
+                                                     args.x, args.topk_weights,
+                                                     args.src_metadata,
+                                                     args.psum_num_recv_tokens_per_scaleup_rank,
+                                                     args.token_metadata_at_forward,
+                                                     args.channel_linked_list,
+                                                     args.nccl_dev_comm, args.nccl_window,
+                                                     args.buffer, args.workspace,
+                                                     args.scaleout_rank_idx, args.scaleup_rank_idx,
                                                      args.num_reduced_tokens));
         } else {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
@@ -153,6 +169,7 @@ static void* launch_combine(void* x,
     auto num_warps = std::min(num_smem_bytes / token_layout.get_num_bytes<true>(), 32);
 
     // Decide warps
+    const bool use_ordered_kernel = use_ordered_hybrid_kernel();
     int num_scaleup_warps = 0, num_forward_warps = 0;
     if (num_scaleout_ranks > 1) {
         EP_HOST_ASSERT(num_channels % num_sms == 0 and
@@ -161,21 +178,28 @@ static void* launch_combine(void* x,
 
         num_scaleup_warps = num_forward_warps = num_channels / num_sms;
 
-        const auto num_data_warps = num_scaleup_warps + num_forward_warps;
-        num_warps = num_data_warps + 1;
-        EP_HOST_ASSERT(num_warps * 32 <= 1024 and
-                       "combine warp count (scale-up + forward + proxy) exceeds the "
-                       "1024-thread block limit; use at least num_channels / 15 SMs");
+        if (use_ordered_kernel) {
+            // The ordered kernel has no proxy warp and only carves TMA buffers out of shmem.
+            num_warps = num_scaleup_warps + num_forward_warps;
+            EP_HOST_ASSERT(num_warps * token_layout.get_num_bytes<true>() <= num_smem_bytes and
+                           "Invalid combine SM count, please try to match your dispatch config");
+        } else {
+            const auto num_data_warps = num_scaleup_warps + num_forward_warps;
+            num_warps = num_data_warps + 1;
+            EP_HOST_ASSERT(num_warps * 32 <= 1024 and
+                           "combine warp count (scale-up + forward + proxy) exceeds the "
+                           "1024-thread block limit; use at least num_channels / 15 SMs");
 
-        // TMA buffers and the proxy hand-off rings both live in the dynamic shmem arena; the
-        // rings are placed after the TMA region (see hybrid_combine_unordered.cuh) so no alignment pad is
-        // needed. Bound by the same total the channel auto-tuner sized against.
-        const int64_t tma_smem_bytes = static_cast<int64_t>(num_data_warps) * token_layout.get_num_bytes<true>();
-        const int64_t proxy_ring_bytes = deep_ep::elastic::ProxyRingLayout::get_num_bytes(
-            num_forward_warps, deep_ep::elastic::kProxyRingDepthDefault);
-        // The channel auto-tuner should prevent this assert from firing; leaving it as a sanity check.
-        EP_HOST_ASSERT(tma_smem_bytes + proxy_ring_bytes <= num_smem_bytes and
-                       "Combine TMA buffers + proxy rings exceed per-block shared memory");
+            // TMA buffers and the proxy hand-off rings both live in the dynamic shmem arena; the
+            // rings are placed after the TMA region (see hybrid_combine_unordered.cuh) so no alignment pad is
+            // needed. Bound by the same total the channel auto-tuner sized against.
+            const int64_t tma_smem_bytes = static_cast<int64_t>(num_data_warps) * token_layout.get_num_bytes<true>();
+            const int64_t proxy_ring_bytes = deep_ep::elastic::ProxyRingLayout::get_num_bytes(
+                num_forward_warps, deep_ep::elastic::kProxyRingDepthDefault);
+            // The channel auto-tuner should prevent this assert from firing; leaving it as a sanity check.
+            EP_HOST_ASSERT(tma_smem_bytes + proxy_ring_bytes <= num_smem_bytes and
+                           "Combine TMA buffers + proxy rings exceed per-block shared memory");
+        }
     }
 
     // Generate, build and launch
@@ -184,6 +208,7 @@ static void* launch_combine(void* x,
         .is_scaleup_nvlink = is_scaleup_nvlink,
         .use_expanded_layout = use_expanded_layout,
         .allow_multiple_reduction = allow_multiple_reduction,
+        .use_ordered_kernel = use_ordered_kernel,
         .num_scaleup_warps = num_scaleup_warps, .num_forward_warps = num_forward_warps,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .hidden = hidden,
@@ -230,6 +255,9 @@ public:
     struct Args {
         // Templated arguments
         bool use_expanded_layout, allow_multiple_reduction;
+        // Use the ordered (upstream) epilogue lookup instead of the unordered recv-map one.
+        // Only meaningful for the hybrid path (`num_scaleout_ranks > 1`).
+        bool use_ordered_kernel;
         int num_scaleout_ranks, num_scaleup_ranks;
         int hidden;
         int num_max_tokens_per_rank;
@@ -257,7 +285,7 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",                        args.use_expanded_layout, args.allow_multiple_reduction,
                            args.launch_args.grid_dim.first,
@@ -266,7 +294,8 @@ static void __instantiate_kernel() {{
                            args.hidden,
                            args.num_max_tokens_per_rank,
                            args.num_experts, args.num_topk,
-                           args.num_channels);
+                           args.num_channels,
+                           args.use_ordered_kernel);
     }
 
     static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
@@ -307,6 +336,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
     const CombineReduceEpilogueRuntime::Args args = {
         .use_expanded_layout = use_expanded_layout,
         .allow_multiple_reduction = allow_multiple_reduction,
+        .use_ordered_kernel = use_ordered_hybrid_kernel(),
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .hidden = hidden,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
