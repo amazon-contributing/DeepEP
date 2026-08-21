@@ -70,6 +70,15 @@ public:
         // TODO: make it more general, e.g. `EP_JIT_EXTRA_FLAGS`
         if (int num_topk_idx_bits = get_env("EP_NUM_TOPK_IDX_BITS", 0); num_topk_idx_bits != 0)
             flags += fmt::format(" -DEP_NUM_TOPK_IDX_BITS={}", num_topk_idx_bits);
+
+        // Sub-part geometry defaults in `hybrid_dispatch_unordered.cuh`. They are device-only (no
+        // host caller reads them), so forwarding them as JIT defines cannot desync host and device,
+        // and `flags` is part of `kernel_signature` below, so a change re-JITs rather than
+        // reusing a stale cubin. Tuning them per network/arch currently requires editing the
+        // header and reinstalling.
+        for (const auto& name: {"EP_NUM_SUB_PARTS", "EP_MIN_SUB_TOKENS", "EP_SM100_MIN_SUB_TOKENS"})
+            if (int v = get_env(name, 0); v != 0)
+                flags += fmt::format(" -D{}={}", name, v);
     }
 
     virtual ~Compiler() = default;
