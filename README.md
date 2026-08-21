@@ -340,6 +340,7 @@ The library provides some environment variables, which may be useful:
     - `EP_NUM_SUB_PARTS`: integer, per-part sub-part count for the unordered hybrid kernel (JIT-forwarded); `0` (unset) uses the header default `2`, `1` disables sub-parts
     - `EP_MIN_SUB_TOKENS`: integer, minimum tokens per sub-part before splitting (JIT-forwarded); `0` (unset) uses the header default `1`
     - `EP_SM100_MIN_SUB_TOKENS`: integer, sm_100+ override for the minimum-tokens-per-sub-part gate (JIT-forwarded); `0` (unset) uses the header default `15`
+    - `EP_MIN_TOKENS_PER_PART`: integer, minimum tokens per scale-out part before splitting (JIT-forwarded); `0` (unset) uses the header default `15`, `1` disables the geometry clamp
 - Networking
     - `EP_NIC_NAME`: string, the default NIC name used to query NIC properties, `mlx5_0` by default
     - `EP_OVERRIDE_RDMA_SL`: integer, override the RDMA service level index for traffic isolation
