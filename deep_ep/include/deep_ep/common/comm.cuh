@@ -15,6 +15,7 @@
 #include <nccl.h>
 #include <nccl_device.h>
 
+#include <deep_ep/common/gin_resource_alloc.cuh>
 #include <deep_ep/common/handle.cuh>
 #include <deep_ep/common/ptx.cuh>
 #include <deep_ep/common/layout.cuh>
@@ -111,8 +112,12 @@ __device__ __forceinline__ std::pair<int, ncclGinResourceSharingMode> get_qp_mod
 template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, bool kWithNotifyWarps = false>
 __device__ __forceinline__ int get_qp_signal_id(
     const int& sm_idx, const int& channel_in_sm_idx) {
-    return channel_to_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, kWithNotifyWarps>(
-        sm_idx, channel_in_sm_idx);
+    // Shifted past the barrier's reserved ids. `channel_to_signal_id` stays 0-based (pure
+    // integer math); the reservation is applied here, at the boundary where a raw offset
+    // becomes a signal id the data path will actually signal.
+    return elastic::gin_alloc::data_signal_id(
+        channel_to_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, kWithNotifyWarps>(
+            sm_idx, channel_in_sm_idx));
 }
 
 // Per-part indexed-signal id: kNumParts contiguous ids under the channel's base id, one
@@ -122,8 +127,12 @@ template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, int kNumParts,
           bool kWithNotifyWarps = false>
 __device__ __forceinline__ int get_per_part_signal_id(
     const int& sm_idx, const int& channel_in_sm_idx, const int& part_idx) {
-    return get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, kWithNotifyWarps>(
-               sm_idx, channel_in_sm_idx) * kNumParts + part_idx;
+    // NOTE: the reservation is added AFTER the multiply, and `channel_to_signal_id` is called
+    // directly rather than through `get_qp_signal_id`. Going through the latter would scale
+    // the offset by `kNumParts` and burn `kNumReservedBarrierSignals * kNumParts` ids.
+    return elastic::gin_alloc::data_signal_id(
+        channel_to_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, kWithNotifyWarps>(
+            sm_idx, channel_in_sm_idx) * kNumParts + part_idx);
 }
 
 template <int kNumRanks, int kNumSMs, int kNumThreads, int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag>
@@ -202,36 +211,144 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
             ncclTeamWorld(nccl_dev_comm) : ncclTeamRail(nccl_dev_comm);
         const ncclGin gin(nccl_dev_comm, 0, NCCL_GIN_RESOURCE_SHARING_CTA);
 
-        // Compact signal indexing: (kNumRanks - 1) signal slots per rank. Sender rank_idx
-        // writes to every peer i at the slot that identifies *itself* in the peer's
-        // enumeration:
-        //   sig = (rank_idx < i) ? rank_idx : (rank_idx - 1)
-        // So on receiver R, each of the (kNumRanks - 1) slots gets exactly +1 from a
-        // distinct sender, and the wait side just iterates all slots looking for one
-        // increment per slot.
-        for (int i = thread_idx; i < kNumRanks; i += kNumThreads) {
-            if (i == rank_idx) continue;
-            const auto sig = static_cast<ncclGinSignal_t>((rank_idx < i) ? rank_idx : (rank_idx - 1));
-            gin.signal(team, i, ncclGin_SignalInc{sig});
-        }
+        // The two team instantiations get DIFFERENT barrier protocols, and the split is
+        // deliberate. Rail gets a counting barrier; World keeps the per-peer barrier
+        // unchanged. Three facts force it:
+        //
+        //  1. Only Rail has a ceiling to remove. `NCCLSymmetricMemoryContext`
+        //     (`csrc/kernels/backend/nccl.cu`) provisions the two paths from different
+        //     arms: the unordered-hybrid arm asks for `gin_indexed_signals_cnt`, a
+        //     per-context budget of `(kTotalQPBudget - 2c)/c` that does NOT grow with the
+        //     team -- that is the budget a per-peer rail barrier overran at 23 domains.
+        //     The direct / ordered arm asks for `num_ranks + 2 * 2`, explicitly commented
+        //     "Customized RDMA barrier needs extra signals". The World barrier's per-peer
+        //     slots are already budgeted there and scale with the team, so that path never
+        //     had the ceiling and gains nothing from being converted.
+        //
+        //  2. Only World is used as a RELEASE barrier. Every Rail call site passes
+        //     `kFlushStores = false` (`hybrid_{dispatch,combine}{,_unordered}.cuh`,
+        //     `barrier.cuh`), so the Rail barrier never even issues the QP flush above --
+        //     it is a pure synchronisation point. The two "ensure data arrival" barriers
+        //     in the hybrid kernels explicitly pass `do_scaleout = false` and run over
+        //     NVLink. By contrast `dispatch.cuh:398` and `combine.cuh:240` take
+        //     `kFlushStores = true` on this World path and then read what peers wrote
+        //     (they trigger the copy-epilogue kernel immediately after).
+        //
+        //  3. A counting barrier cannot carry release. Its counter is anonymous, so a peer
+        //     one round ahead can supply an increment that stands in for a delayed
+        //     current-round arrival: the count reaches its target without every distinct
+        //     peer having arrived. "Everyone arrived" survives that (a rank can only be a
+        //     round ahead if it already saw everyone), but "every peer's prior writes are
+        //     visible to me" does not. Signal STRENGTH cannot repair it either -- strong
+        //     signals order a sender's own prior puts, they do not say which sender
+        //     incremented. Identity is the missing half, and only per-peer slots have it.
+        //
+        // So: convert the path that has the ceiling and does not need release; leave the
+        // path that needs release and has no ceiling exactly as it was.
+        if constexpr (std::is_same_v<team_t, ncclTeamTagWorld>) {
+            // UNCHANGED from the base commit apart from this block's four-space re-indent,
+            // so this path can be reviewed as "not touched" (strip comments and whitespace
+            // from both revisions and compare: 746 characters of code, identical). Compact signal indexing: (kNumRanks - 1) signal
+            // slots per rank. Sender rank_idx writes to every peer i at the slot that
+            // identifies *itself* in the peer's enumeration:
+            //   sig = (rank_idx < i) ? rank_idx : (rank_idx - 1)
+            // So on receiver R, each of the (kNumRanks - 1) slots gets exactly +1 from a
+            // distinct sender, and the wait side just iterates all slots looking for one
+            // increment per slot.
+            for (int i = thread_idx; i < kNumRanks; i += kNumThreads) {
+                if (i == rank_idx) continue;
+                const auto sig = static_cast<ncclGinSignal_t>((rank_idx < i) ? rank_idx : (rank_idx - 1));
+                gin.signal(team, i, ncclGin_SignalInc{sig});
+            }
 
-        for (int i = thread_idx; i < kNumRanks - 1; i += kNumThreads) {
-            const auto signal_idx = static_cast<ncclGinSignal_t>(i);
-            const auto shadow_ptr = gin.getSignalShadowPtr(signal_idx);
-            const auto target = ++(*shadow_ptr);
+            for (int i = thread_idx; i < kNumRanks - 1; i += kNumThreads) {
+                const auto signal_idx = static_cast<ncclGinSignal_t>(i);
+                const auto shadow_ptr = gin.getSignalShadowPtr(signal_idx);
+                const auto target = ++(*shadow_ptr);
 
-            // TODO(NCCL): Using the official NCCL wait signal API, after they added timeout check.
-            timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-                const auto signal = gin.readSignal(signal_idx, 64, cuda::memory_order_acquire);
-                if (signal >= target)
-                    return true;
+                // TODO(NCCL): Using the official NCCL wait signal API, after they added timeout check.
+                timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
+                    const auto signal = gin.readSignal(signal_idx, 64, cuda::memory_order_acquire);
+                    if (signal >= target)
+                        return true;
 
-                if (is_last_check) {
-                    printf("DeepEP Gin barrier timeout, tag: %d, scaleout: %d, scaleup: %d, thread: %d, "
-                           "signal: %lu, target: %lu\n", kTag, scaleout_rank_idx, scaleup_rank_idx, thread_idx, signal, target);
-                }
-                return false;
-            });
+                    if (is_last_check) {
+                        printf("DeepEP Gin barrier timeout, tag: %d, scaleout: %d, scaleup: %d, thread: %d, "
+                               "signal: %lu, target: %lu\n", kTag, scaleout_rank_idx, scaleup_rank_idx, thread_idx, signal, target);
+                    }
+                    return false;
+                });
+            }
+        } else {
+            // Counting signal barrier, for the RAIL team only. Every sender adds 1 to the
+            // SAME signal id on every peer, and the waiter advances its shadow by the
+            // number of increments one barrier round delivers, (kNumRanks - 1). A
+            // synchronisation-only barrier is a counting predicate, so it does not need to
+            // distinguish senders -- see the three-point argument above for why that is
+            // true here and false on the World path.
+            //
+            // This costs ONE indexed-signal slot instead of (kNumRanks - 1), which is what
+            // removes the team-size term from the per-context signal budget, and hence the
+            // scale-out ceiling: measured on p6-b200, 22 NVLink domains complete and 23
+            // refuse at the shipped context count.
+            //
+            // The pattern is the one the unordered data path already relies on: a single
+            // signal accumulating increments from many remote senders, polled against a
+            // shadow advanced by the expected delta (`hybrid_combine_unordered.cuh`, the
+            // `num_expected_arrivals` wait; sends there use `ncclGin_SignalAdd{.., 1}`).
+            // `SignalAdd{.., 1}` is used here rather than `SignalInc` to match that
+            // precedent exactly.
+            // Reserved id, off-limits to the data path -- see `kNumReservedBarrierSignals`.
+            constexpr auto kBarrierSignal =
+                static_cast<ncclGinSignal_t>(elastic::gin_alloc::kBarrierSignalId);
+            for (int i = thread_idx; i < kNumRanks; i += kNumThreads) {
+                if (i == rank_idx) continue;
+                gin.signal(team, i, ncclGin_SignalAdd{kBarrierSignal, 1ull});
+            }
+
+            // Two block-wide syncs bracket the wait, and they do different jobs.
+            //
+            // BEFORE: every thread has issued its strided share of the sends above. Without
+            // this, thread 0 enters the spin below while lanes 1..31 of its own warp still
+            // have sends pending -- a divergent warp with one tight polling loop starves the
+            // sending lanes, and at large `kNumRanks` that delays outbound sends against a
+            // running timeout.
+            //
+            // AFTER: a single slot means a single waiter, so the other threads must not run
+            // ahead of the barrier. The per-peer layout had every thread wait on its own
+            // slot, which made "all threads have observed completion" implicit; it has to be
+            // restored explicitly here.
+            //
+            // The enclosing `if (sm_idx == 0)` is uniform across the block (`sm_idx` is
+            // derived from `blockIdx.x` at every call site, including the synthetic
+            // `sm_idx - 1` in `gpu_barrier`'s hybrid split), so both syncs are reached by
+            // all of the block's threads.
+            __syncthreads();
+
+            if (thread_idx == 0) {
+                const auto shadow_ptr = gin.getSignalShadowPtr(kBarrierSignal);
+                const auto target = (*shadow_ptr += static_cast<uint64_t>(kNumRanks - 1));
+
+                // TODO(NCCL): Using the official NCCL wait signal API, after they added timeout check.
+                timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
+                    const auto signal = gin.readSignal(kBarrierSignal, 64, cuda::memory_order_acquire);
+                    if (signal >= target)
+                        return true;
+
+                    if (is_last_check) {
+                        // Report the shortfall: with one counting slot the stalled *peer* is
+                        // no longer identifiable, so print how many of the expected arrivals
+                        // are missing, and the signal id.
+                        printf("DeepEP Gin barrier timeout, tag: %d, scaleout: %d, scaleup: %d, "
+                               "signal_id: %d, observed: %lu, target: %lu, missing: %lu of %d\n",
+                               kTag, scaleout_rank_idx, scaleup_rank_idx,
+                               static_cast<int>(kBarrierSignal), signal, target,
+                               target - signal, kNumRanks - 1);
+                    }
+                    return false;
+                });
+            }
+            __syncthreads();
         }
     }
 }
@@ -284,6 +401,41 @@ __forceinline__ __device__ void gpu_barrier(const handle::NCCLGin& gin,
     } else {
         EP_STATIC_ASSERT(not kFlushStores, "No data to be flushed");
     }
+
+    // A GIN scale-up barrier (`ncclTeamTagWorld`) and a GIN scale-out barrier
+    // (`ncclTeamTagRail`) would both land on the SAME shadow: NCCL addresses shadows by
+    // (context, signal) only -- `_signalShadows = comm.ginSignalShadows + contextIndex *
+    // comm.ginSignalCount` -- with no team or tag term. Both use context 0, and their id
+    // ranges overlap even though the two now run different protocols: World's per-peer
+    // slots start at 0 and Rail's counting slot IS 0. So if they were ever live
+    // CONCURRENTLY they would corrupt each other -- World would read Rail's increments as
+    // peer 0's arrival, and Rail's count would absorb World's. Rail is a subset of World,
+    // so the two rank sets are not even disjoint.
+    //
+    // Three ways that cannot happen, any one of which is sufficient:
+    //   * scale-up runs over NVLink, so it never touches a GIN signal at all; or
+    //   * there is no scale-up team to synchronize (`do_scaleup` is masked off below); or
+    //   * there is no scale-out team to synchronize (`do_scaleout` likewise).
+    // Note this is about CONCURRENCY: `barrier.cuh`'s sequential path issues Rail and World
+    // from two separate, globally ordered `gpu_barrier` calls and is safe for that reason,
+    // which is why the condition below is a disjunction rather than the stricter
+    // `kIsScaleupNVLink or kNumScaleoutRanks <= 1`.
+    //
+    // Today no instantiation can violate it: `NCCLSymmetricMemoryContext`
+    // (`csrc/kernels/backend/nccl.cu`) sets `num_scaleup_ranks = num_nvl_ranks` in hybrid mode
+    // -- making `is_scaleup_nvlink` true there by construction -- and `num_scaleout_ranks = 1`
+    // in direct mode. This assert exists so that stops being an accident.
+    //
+    // CAVEAT on the safety net: these kernels are NVRTC-generated from runtime values
+    // (`csrc/kernels/elastic/*.hpp` format the template arguments into the instantiation), so
+    // a violation surfaces as a JIT compile exception on first launch, in production -- NOT
+    // as a build failure. The host-side `EP_HOST_ASSERT` in `NCCLSymmetricMemoryContext` is
+    // the gate that actually fails early; this one is the backstop for a caller that
+    // constructs the template arguments some other way.
+    EP_STATIC_ASSERT(kIsScaleupNVLink or kNumScaleupRanks <= 1 or kNumScaleoutRanks <= 1,
+                     "A GIN scale-up barrier and a GIN scale-out barrier would share the "
+                     "reserved barrier signal id; allocate a second reserved id before "
+                     "allowing this combination");
 
     do_scaleout &= kNumScaleoutRanks > 1;
     do_scaleup &= kNumScaleupRanks > 1;

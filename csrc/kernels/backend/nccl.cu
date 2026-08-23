@@ -130,9 +130,34 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
             gin_config.gin_indexed_signals_cnt = 0;
         }
 
-        EP_HOST_ASSERT(gin_config.gin_indexed_signals_cnt >= (num_rdma_ranks - 1) and
-                       "GIN indexed-signal budget cannot give each peer rail team a dedicated "
-                       "signal; reduce num_allocated_qps to raise the per-context signal count");
+        // The RAIL instantiation of `gin_barrier_wo_local_sync` is now a counting barrier:
+        // every peer adds to a single signal id and the waiter advances its shadow by the
+        // expected arrival count, so the rail barrier costs ONE indexed-signal slot whatever
+        // the team size. Single-domain runs take the NVLink barrier and consume none.
+        //
+        // The change is scoped to Rail on purpose. This arm is the only one with the
+        // ceiling, and the Rail barrier is the only one that never carries release
+        // semantics -- every rail call site passes `kFlushStores = false`. The World
+        // instantiation, reached only from the direct / ordered arm below (which asks for
+        // `num_ranks + 2 * 2` signals and therefore has no ceiling), keeps the per-peer
+        // barrier: `dispatch.cuh` and `combine.cuh` use it with `kFlushStores = true` to
+        // "ensure data arrival", and an anonymous counter cannot establish that N distinct
+        // peers arrived -- a peer a round ahead can supply two of the increments.
+        //
+        // This is what removes the scale-out ceiling. The previous check scaled with the
+        // team size against a per-context budget fixed at (kTotalQPBudget - 2c)/c, and so
+        // refused to initialize past 22 NVLink domains at the default context count --
+        // measured on p6-b200: 22 domains complete, 23 refuse. The budget's only remaining
+        // TEAM-SIZE-DEPENDENT consumer is the data path, whose requirement
+        // (ceil(channels/qp) * num_parts) does not grow with the team and is enforced by
+        // `compute_part_allocation`. The barrier still consumes a fixed
+        // `kNumReservedBarrierSignals` on every context -- that reservation is what keeps the
+        // data path from ever producing the barrier's id.
+        const int barrier_signal_slots =
+            scaleout_active ? elastic::gin_alloc::kNumReservedBarrierSignals : 0;
+        EP_HOST_ASSERT(gin_config.gin_indexed_signals_cnt >= barrier_signal_slots and
+                       "GIN indexed-signal budget cannot host the barrier's counting signal; "
+                       "reduce num_allocated_qps to raise the per-context signal count");
 
         if (scaleout_active)
             this->num_allocated_qps = gin_config.gin_context_cnt;
@@ -197,6 +222,18 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
         scaleout_rank_idx = 0, scaleup_rank_idx = rank_idx;
     }
     is_scaleup_nvlink = num_scaleup_ranks == num_nvl_ranks;
+
+    // The two device barriers overlap in the same (context, signal) space -- World's
+    // per-peer slots start at id 0 and Rail's counting slot IS id 0 -- so a GIN scale-up
+    // barrier and a GIN scale-out barrier must never be live concurrently. See
+    // `gpu_barrier` in `comm.cuh` for why, and for the same condition as a static assert.
+    // The two branches above make this unreachable, but the kernels are JIT-generated from
+    // exactly these values, so without a host gate a violation would surface as a compile
+    // exception on first launch rather than here at init.
+    EP_HOST_ASSERT((is_scaleup_nvlink or num_scaleup_ranks <= 1 or num_scaleout_ranks <= 1) and
+                   "A GIN scale-up barrier and a GIN scale-out barrier would share the "
+                   "reserved barrier signal id; allocate a second reserved id before "
+                   "allowing this combination");
 
     // Create symmetric memory
     // num_bytes = GPU + CPU, derive GPU portion
