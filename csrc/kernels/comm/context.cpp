@@ -9,6 +9,7 @@
 //
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 #include <string>
@@ -160,18 +161,16 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
             const int num_rail_ranks = ncclTeamRail(comm).nRanks;
             const bool scaleout_active = num_rail_ranks > 1;
 
-            auto resolve_gin_context_cnt = [&]() -> int {
-                const int ctx = num_allocated_qps == 0 ? gin_alloc::kDefaultGinContextCnt
-                                                       : num_allocated_qps;
-                EP_HOST_ASSERT(ctx >= gin_alloc::kMinGinContextCnt and
-                               ctx <= gin_alloc::kMaxGinContextCnt and
-                               "num_allocated_qps must be 0 (auto -> kDefaultGinContextCnt) or "
-                               "within [kMinGinContextCnt, kMaxGinContextCnt]: one GIN context "
-                               "supplies one QP");
-                return ctx;
-            };
+            const int requested = num_allocated_qps == 0 ? gin_alloc::kDefaultGinContextCnt
+                                                         : num_allocated_qps;
+            int context_cnt = std::clamp(requested, gin_alloc::kMinGinContextCnt,
+                                                    gin_alloc::kMaxGinContextCnt);
+            if (context_cnt != requested)
+                printf("[WARN] DeepEP clamped num_allocated_qps from %d to %d: the unordered "
+                       "GIN layout supports [%d, %d] contexts (one GIN context supplies one QP)\n",
+                       requested, context_cnt,
+                       gin_alloc::kMinGinContextCnt, gin_alloc::kMaxGinContextCnt);
 
-            int context_cnt = resolve_gin_context_cnt();
             if (scaleout_active) {
                 const auto gin_config = gin_alloc::make_gin_resources(context_cnt);
                 gin_indexed_signals_cnt = gin_config.gin_indexed_signals_cnt;

@@ -1227,6 +1227,10 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_ep_buffer_alignment", [=]() {
         return kNumAllocationAlignmentBytes;
     });
+    // Exported here rather than from `python_api.cpp`, where V2 put them
+    m.attr("min_unordered_gin_qps") = pybind11::int_(gin_alloc::kMinGinContextCnt);
+    m.attr("max_unordered_gin_qps") = pybind11::int_(gin_alloc::kMaxGinContextCnt);
+    m.attr("default_unordered_gin_qps") = pybind11::int_(gin_alloc::kDefaultGinContextCnt);
 
 }
 
