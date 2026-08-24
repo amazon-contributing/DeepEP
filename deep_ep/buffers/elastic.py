@@ -377,6 +377,11 @@ class ElasticBuffer:
                                         self.explicitly_destroy)
 
         self.num_allocated_qps = self.runtime.get_num_allocated_qps()
+        # The unordered hybrid path intentionally passes 0 down and relies on C++ to
+        # resolve it (see the automatic QP count above). A 0 read back here means that
+        # delegation did not happen; it would surface far downstream as `kNumQPs == 0`.
+        assert self.num_allocated_qps >= 1, \
+            f'runtime returned num_allocated_qps={self.num_allocated_qps}: the QP count was never resolved'
 
         # Logical rank indices
         self.num_scaleout_ranks, self.num_scaleup_ranks = self.get_logical_domain_size()
