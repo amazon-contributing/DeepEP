@@ -171,9 +171,8 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
                 return ctx;
             };
 
-            int context_cnt = num_allocated_qps;
+            int context_cnt = resolve_gin_context_cnt();
             if (scaleout_active) {
-                context_cnt = resolve_gin_context_cnt();
                 const auto gin_config = gin_alloc::make_gin_resources(context_cnt);
                 gin_indexed_signals_cnt = gin_config.gin_indexed_signals_cnt;
                 EP_HOST_ASSERT(gin_indexed_signals_cnt >= num_rail_ranks - 1 and
@@ -185,8 +184,7 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
                 gin_indexed_signals_cnt = 0;
             }
 
-            if (scaleout_active)
-                this->num_allocated_qps = context_cnt;
+            this->num_allocated_qps = context_cnt;
             reqs.ginContextCount = context_cnt;
             reqs.ginExclusiveContexts = false;
             // The unordered kernels synchronize through counting signals only; VA and

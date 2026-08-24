@@ -370,7 +370,12 @@ class EPBuffer(BufferBase):
             self.explicitly_destroy)
         self.context = self.runtime.context
 
+        # The unordered hybrid path intentionally passes 0 down and relies on C++ to
+        # resolve it (see the automatic QP count above). A 0 read back here means that
+        # delegation did not happen; it would surface far downstream as `kNumQPs == 0`.
         self.num_allocated_qps = self.context.num_allocated_qps
+        assert self.num_allocated_qps >= 1, \
+            f'runtime returned num_allocated_qps={self.num_allocated_qps}: the QP count was never resolved'
 
         # Materialize LB allocation plan
         if lb_allocation_plan is not None:
