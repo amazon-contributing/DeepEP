@@ -113,13 +113,20 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
         // upstream requirements untouched.
         if (allow_hybrid_mode and not elastic::use_ordered_hybrid_kernel()) {
         auto resolve_gin_context_cnt = [&]() -> int {
-            const int ctx = (this->num_allocated_qps == 0)
+            const int requested = (this->num_allocated_qps == 0)
                 ? elastic::gin_alloc::kDefaultGinContextCnt
                 : this->num_allocated_qps;
-            EP_HOST_ASSERT(ctx >= elastic::gin_alloc::kMinGinContextCnt and
-                           ctx <= elastic::gin_alloc::kMaxGinContextCnt and
-                           "num_allocated_qps must be 0 (auto -> kDefaultGinContextCnt) or within "
-                           "[kMinGinContextCnt, kMaxGinContextCnt]: one GIN context supplies one QP");
+            int ctx = requested;
+            if (ctx < elastic::gin_alloc::kMinGinContextCnt)
+                ctx = elastic::gin_alloc::kMinGinContextCnt;
+            if (ctx > elastic::gin_alloc::kMaxGinContextCnt)
+                ctx = elastic::gin_alloc::kMaxGinContextCnt;
+            if (ctx != requested)
+                printf("[WARN] DeepEP clamped num_allocated_qps from %d to %d: the unordered "
+                       "GIN layout supports [%d, %d] contexts (one GIN context supplies one QP)\n",
+                       requested, ctx,
+                       elastic::gin_alloc::kMinGinContextCnt,
+                       elastic::gin_alloc::kMaxGinContextCnt);
             return ctx;
         };
 

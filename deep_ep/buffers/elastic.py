@@ -282,10 +282,11 @@ class ElasticBuffer:
                 resolves per hybrid kernel mode (see `EP_HYBRID_KERNEL`):
                   - unordered (default): 11 QPs and 21 signals per QP, for the balance
                     between token batch size and the number of QPs. An explicit value
-                    must be within [2, 17]; anything else is rejected. Requesting fewer
+                    is clamped into [2, 17] with a warning. Requesting fewer
                     QPs gives each context more signals.
                   - ordered: 129 QPs. This mode signals through VA/strong signals rather than
-                    the indexed-signal budget.
+                    the indexed-signal budget, so any explicit value passes through
+                    without restriction.
             num_cpu_timeout_secs: CPU-side timeout in seconds for CPU sync.
             num_gpu_timeout_secs: GPU-side timeout in seconds for GPU operations.
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
@@ -356,6 +357,13 @@ class ElasticBuffer:
                 num_allocated_qps = 65 if check_fast_rdma_atomic_support() else 129
             else:
                 num_allocated_qps = 17
+        elif num_allocated_qps > 0 and self.allow_hybrid_mode and os.environ.get('EP_HYBRID_KERNEL', 'unordered') != 'ordered':
+            clamped_qps = max(_C.min_unordered_gin_qps, min(num_allocated_qps, _C.max_unordered_gin_qps))
+            if clamped_qps != num_allocated_qps:
+                print(f'[WARN] DeepEP clamped num_allocated_qps from {num_allocated_qps} to {clamped_qps}: '
+                      f'the unordered GIN layout supports [{_C.min_unordered_gin_qps}, {_C.max_unordered_gin_qps}] '
+                      f'contexts (one GIN context supplies one QP)', flush=True)
+                num_allocated_qps = clamped_qps
 
         # Create CPU communicator (exchange POSIX FD handles for CPU segments)
         cpu_comm = []
