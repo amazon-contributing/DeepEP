@@ -62,6 +62,11 @@ QP_MAPPING_HD constexpr QPSlot balanced_partition(int idx, int n, int q) {
 template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, bool kWithNotifyWarps>
 QP_MAPPING_HD constexpr int channel_to_qp(int sm_idx, int channel_in_sm_idx,
                                           bool is_notify_warp = false) {
+    static_assert(kNumQPs >= 1,
+                  "kNumQPs must be >= 1. With 0 the kNumQPs == 1 fast path is skipped, "
+                  "kNumSMs <= kNumAvailableQPs is false, and balanced_partition() is called "
+                  "with q == 0, i.e. n / 0. Compiled for the host this specialization exits on "
+                  "SIGFPE; in a GPU run it produced corrupted output and no reported fault.");
     // Only one QP
     if constexpr (kNumQPs == 1)
         return 0;
@@ -95,6 +100,11 @@ QP_MAPPING_HD constexpr int channel_to_qp(int sm_idx, int channel_in_sm_idx,
 // `signal_id < ceil(channels / qps)` -- within the tuner's signal budget.
 template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, bool kWithNotifyWarps>
 QP_MAPPING_HD constexpr int channel_to_signal_id(int sm_idx, int channel_in_sm_idx) {
+    static_assert(kNumQPs >= 1,
+                  "kNumQPs must be >= 1. With 0 the kNumQPs == 1 fast path is skipped, "
+                  "kNumSMs <= kNumAvailableQPs is false, and balanced_partition() is called "
+                  "with q == 0, i.e. n / 0. Compiled for the host this specialization exits on "
+                  "SIGFPE; in a GPU run it produced corrupted output and no reported fault.");
     if constexpr (kNumQPs == 1)
         return sm_idx * kNumChannelsPerSM + channel_in_sm_idx;
 

@@ -77,6 +77,12 @@ __device__ __forceinline__ void timeout_while(const func_t& func, const int64_t&
 template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, bool kWithNotifyWarps = false>
 __device__ __forceinline__ std::pair<int, ncclGinResourceSharingMode> get_qp_mode(
     const int& sm_idx, const int& channel_in_sm_idx, const bool& is_notify_warp = false) {
+    static_assert(kNumQPs >= 1,
+                  "kNumQPs must be >= 1. With 0 the kNumQPs == 1 fast path is skipped, "
+                  "kNumSMs <= kNumAvailableQPs is false, and balanced_partition() is called "
+                  "with q == 0, i.e. n / 0. Compiled for the host this specialization exits on "
+                  "SIGFPE; in a GPU run it produced corrupted output and no reported fault.");
+
     constexpr auto kSharingCTA = NCCL_GIN_RESOURCE_SHARING_CTA;
     constexpr auto kSharingGrid = kNumSMs == 1 ? NCCL_GIN_RESOURCE_SHARING_CTA : NCCL_GIN_RESOURCE_SHARING_GPU;
 
