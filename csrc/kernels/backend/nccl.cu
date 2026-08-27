@@ -137,9 +137,14 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
             gin_config.gin_indexed_signals_cnt = 0;
         }
 
-        EP_HOST_ASSERT(gin_config.gin_indexed_signals_cnt >= (num_rdma_ranks - 1) and
-                       "GIN indexed-signal budget cannot give each peer rail team a dedicated "
-                       "signal; reduce num_allocated_qps to raise the per-context signal count");
+        // The rail barrier is a counting barrier (`gin_barrier_wo_local_sync`, comm.cuh):
+        // it costs `kNumReservedBarrierSignals` slots per context regardless of the team
+        // size. Single-domain runs take the NVLink barrier and consume none.
+        const int barrier_signal_slots =
+            scaleout_active ? elastic::gin_alloc::kNumReservedBarrierSignals : 0;
+        EP_HOST_ASSERT(gin_config.gin_indexed_signals_cnt >= barrier_signal_slots and
+                       "GIN indexed-signal budget cannot host the barrier's counting signal; "
+                       "reduce num_allocated_qps to raise the per-context signal count");
 
         this->num_allocated_qps = gin_config.gin_context_cnt;
 
@@ -203,6 +208,11 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
         scaleout_rank_idx = 0, scaleup_rank_idx = rank_idx;
     }
     is_scaleup_nvlink = num_scaleup_ranks == num_nvl_ranks;
+
+    EP_HOST_ASSERT((is_scaleup_nvlink or num_scaleup_ranks <= 1 or num_scaleout_ranks <= 1) and
+                   "A GIN scale-up barrier and a GIN scale-out barrier would share the "
+                   "reserved barrier signal id; allocate a second reserved id before "
+                   "allowing this combination");
 
     // Create symmetric memory
     // num_bytes = GPU + CPU, derive GPU portion

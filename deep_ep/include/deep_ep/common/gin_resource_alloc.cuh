@@ -64,20 +64,32 @@ __forceinline__ __device__ __host__ constexpr GinResourceConfig make_gin_resourc
     return GinResourceConfig{gin_indexed_signals_for(gin_context_cnt), gin_context_cnt};
 }
 
-// Each ScaleOut warp (== channel) needs its own dedicated indexed signal id, so the total
-// signal budget (ctx * signals/ctx) must cover the worst-case warp count for EVERY legal
-// context count, not just the default. The tightest points are ctx = 13 and ctx = 17, both at
-// 221 against the 220-warp ceiling -- one signal of slack. Do not raise `kMaxSM` /
-// `kMaxWarpsPerSM`, widen the context range, or lower `kTotalQPBudget` without re-checking.
-__forceinline__ __host__ constexpr bool all_gin_context_counts_cover_warps() {
-    for (int ctx = kMinGinContextCnt; ctx <= kMaxGinContextCnt; ++ ctx)
-        if (ctx * gin_indexed_signals_for(ctx) < kMaxScaleoutWarps)
-            return false;
-    return true;
+// Indexed-signal ids reserved for the rail counting barrier (`gin_barrier_wo_local_sync`,
+// comm.cuh), taken off the bottom of every context's id space so no data channel can
+// produce the barrier's id. Plain `int`, not an NCCL signal type: this header stays
+// NCCL-free and host-compilable so the invariants below can be `static_assert`s.
+static constexpr int kNumReservedBarrierSignals = 1;
+static constexpr int kBarrierSignalId = 0;
+static_assert(kBarrierSignalId >= 0 and kBarrierSignalId < kNumReservedBarrierSignals,
+              "the barrier's signal id must lie inside the reserved range");
+
+// The single place the reservation offset is applied; both id derivations in `comm.cuh`
+// route through it.
+__forceinline__ __device__ __host__ constexpr int data_signal_id(int raw_offset) {
+    return kNumReservedBarrierSignals + raw_offset;
 }
-static_assert(all_gin_context_counts_cover_warps(),
-              "GIN layout cannot give each ScaleOut warp a dedicated signal id "
-              "for every legal context count");
+
+// Signals the data path may use: the provisioned per-context count minus the barrier
+// reservation.
+__forceinline__ __device__ __host__ constexpr int usable_signal_budget(const GinResourceConfig& cfg) {
+    return cfg.gin_indexed_signals_cnt > kNumReservedBarrierSignals
+         ? cfg.gin_indexed_signals_cnt - kNumReservedBarrierSignals : 0;
+}
+
+// Every legal context count must remain serviceable at the worst-case launch (`kMaxSM`
+// SMs x `kMaxWarpsPerSM` ScaleOut warps): `compute_part_allocation` must return at least
+// one channel per SM and at least one part. Defined below, after the math it checks.
+__forceinline__ __host__ constexpr bool all_gin_context_counts_are_serviceable();
 
 // Preferred (and workspace-sizing) maximum for per-part signalling.
 static constexpr int kMaxParts = 4;
@@ -120,11 +132,13 @@ __forceinline__ __device__ __host__ constexpr int channels_per_context(
 }
 
 // Per-part signal allocation: pick the largest num_parts (up to kMaxParts) that fits
-//   channels_per_context(...) * num_parts <= gin_indexed_signals_cnt
+//   channels_per_context(...) * num_parts <= usable_signal_budget(cfg)
 // at the requested channels/SM, then reduce channels_per_sm until the budget holds.
-__forceinline__ __device__ __host__ constexpr GinPartAllocation compute_part_allocation(
+// `_raw` is the diagnostics-free math so `static_assert`s can evaluate it;
+// `compute_part_allocation` below adds the host-side warning and check.
+__forceinline__ __device__ __host__ constexpr GinPartAllocation compute_part_allocation_raw(
         const GinResourceConfig& cfg, int num_sms, int num_available_qps, int num_channels_per_sm) {
-    const int gin_signals = cfg.gin_indexed_signals_cnt;
+    const int gin_signals = usable_signal_budget(cfg);
     const int channels_per_ctx = channels_per_context(num_sms, num_available_qps, num_channels_per_sm);
     const int budget_parts = gin_signals / (channels_per_ctx > 1 ? channels_per_ctx : 1);
     GinPartAllocation alloc{};
@@ -135,19 +149,49 @@ __forceinline__ __device__ __host__ constexpr GinPartAllocation compute_part_all
            static_cast<long long>(channels_per_context(num_sms, num_available_qps,
                                                       alloc.num_channels_per_sm)) * alloc.num_parts > gin_signals)
         --alloc.num_channels_per_sm;
+    return alloc;
+}
+
+// True when the allocation fits the usable budget (the reduction loop converged).
+__forceinline__ __device__ __host__ constexpr bool part_allocation_fits(
+        const GinResourceConfig& cfg, int num_sms, int num_available_qps, const GinPartAllocation& alloc) {
+    return static_cast<long long>(channels_per_context(num_sms, num_available_qps,
+                                                       alloc.num_channels_per_sm)) * alloc.num_parts
+           <= usable_signal_budget(cfg);
+}
+
+__forceinline__ __device__ __host__ constexpr GinPartAllocation compute_part_allocation(
+        const GinResourceConfig& cfg, int num_sms, int num_available_qps, int num_channels_per_sm) {
+    const GinPartAllocation alloc =
+        compute_part_allocation_raw(cfg, num_sms, num_available_qps, num_channels_per_sm);
 #ifndef __CUDA_ARCH__
     if (alloc.num_channels_per_sm < num_channels_per_sm)
         printf("[WARN] DeepEP GIN signal budget reduced the number of channels per SM "
                "from %d to %d\n", num_channels_per_sm, alloc.num_channels_per_sm);
-#endif
-#ifndef __CUDA_ARCH__
-    EP_HOST_ASSERT(static_cast<long long>(channels_per_context(num_sms, num_available_qps,
-                                                               alloc.num_channels_per_sm)) * alloc.num_parts <= gin_signals and
+    EP_HOST_ASSERT(part_allocation_fits(cfg, num_sms, num_available_qps, alloc) and
                    "GIN signal budget cannot host even 1 part-signal per channel "
                    "at 1 channel/SM. Reduce --num-sms or num_allocated_qps.");
 #endif
     return alloc;
 }
+
+// The invariant declared above, now that the math it checks is in scope.
+__forceinline__ __host__ constexpr bool all_gin_context_counts_are_serviceable() {
+    for (int ctx = kMinGinContextCnt; ctx <= kMaxGinContextCnt; ++ ctx) {
+        // The notify warp owns QP 0, so only `ctx - 1` contexts carry data channels.
+        const int avail = ctx > 1 ? ctx - 1 : 1;
+        const auto cfg = make_gin_resources(ctx);
+        const auto alloc = compute_part_allocation_raw(cfg, kMaxSM, avail, kMaxWarpsPerSM);
+        if (alloc.num_channels_per_sm < 1 or alloc.num_parts < 1)
+            return false;
+        if (not part_allocation_fits(cfg, kMaxSM, avail, alloc))
+            return false;
+    }
+    return true;
+}
+static_assert(all_gin_context_counts_are_serviceable(),
+              "some legal GIN context count cannot service the worst-case launch "
+              "(kMaxSM x kMaxWarpsPerSM) once the barrier reservation is taken out");
 
 // Kernel-side entry points: derive the per-channel part count (and verify the launched
 // channel count) as compile-time constants from the provisioned indexed-signal budget.
