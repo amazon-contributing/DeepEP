@@ -34,6 +34,33 @@ namespace deep_ep::elastic {
 //
 // The value is read once per process. It changes the JIT-generated source (header and
 // kernel names differ), so the JIT cache distinguishes the two variants automatically.
+// `EP_COMBINE_GATE` selects how the unordered combine's return gate synchronizes:
+//
+//   "signal" (default) — counting GIN indexed signals (the existing path).
+//
+//   "flag"             — a 4-byte iteration number written by putValue into a
+//                        symmetric workspace slot; the receiver polls it. The
+//                        sender flushes its data puts before writing the flag.
+//
+// Read once per process; JIT-cached per variant. Only the unordered kernel has
+// this gate, so "flag" rejects EP_HYBRID_KERNEL=ordered.
+static bool use_flag_combine_gate() {
+    static const bool flag = [] {
+        const auto value = get_env<std::string>("EP_COMBINE_GATE");
+        bool result = false;
+        if (value.empty() or value == "signal") {
+            result = false;
+        } else if (value == "flag") {
+            result = true;
+        } else {
+            EP_HOST_ASSERT(false and "EP_COMBINE_GATE must be `signal` or `flag`");
+        }
+        printf("DeepEP combine gate selection: %s\n", result ? "flag" : "signal");
+        return result;
+    }();
+    return flag;
+}
+
 static bool use_ordered_hybrid_kernel() {
     static const bool ordered = [] {
         const auto value = get_env<std::string>("EP_HYBRID_KERNEL");

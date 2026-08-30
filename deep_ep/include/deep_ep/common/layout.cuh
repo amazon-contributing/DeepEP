@@ -88,6 +88,9 @@ struct WorkspaceLayout {
         // AGRS signals
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
 
+        // Combine gate flags (allocated unconditionally so all gate modes share one layout)
+        num_bytes += kNumMaxRanks * kNumMaxChannels * sizeof(uint32_t);
+
         return num_bytes;
     }
 
@@ -185,6 +188,16 @@ struct WorkspaceLayout {
         const auto base_ptr = math::advance_ptr<int>(
             get_agrs_recv_signal_ptr(0, 0), kNumMaxInflightAGRS * kNumMaxRanks * sizeof(int));
         return base_ptr + rank_idx;
+    }
+
+    // Per-(channel, sender) combine iteration flags for EP_COMBINE_GATE=flag.
+    // Monotonic across iterations: zeroed once at construction, never reset
+    // (carve-out from the keep-workspace-zero rule in buffer.hpp).
+    __forceinline__ __device__ __host__ uint32_t* get_combine_gate_flag_ptr(
+        const int& channel_idx, const int& scaleout_rank_idx) const {
+        const auto base_ptr = math::advance_ptr<uint32_t>(
+            get_agrs_session_signal_ptr(0), kNumMaxRanks * sizeof(int));
+        return base_ptr + (channel_idx * num_scaleout_ranks + scaleout_rank_idx);
     }
 };
 

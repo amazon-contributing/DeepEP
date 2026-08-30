@@ -21,6 +21,7 @@
 namespace deep_ep::elastic {
 
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
+          bool kUseFlagGate,
           int kNumSMs,
           int kNumScaleupWarps, int kNumForwardWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -56,7 +57,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
                     void* buffer, void* workspace,
                     const int scaleout_rank_idx, const int scaleup_rank_idx,
-                    int num_reduced_tokens, const int num_combined_tokens) {
+                    int num_reduced_tokens, const int num_combined_tokens,
+                    const int combine_iteration) {
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x);
     const auto thread_idx = static_cast<int>(threadIdx.x);
@@ -676,6 +678,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         // Update, wait and clean
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Invalid ranks");
 
+        if constexpr (not kUseFlagGate) {
         // Derive the expected inbound put count for this channel by counting my own
         // outbound routing decisions during dispatch. Count "distinct valid non-local packed
         // entries per T" — same rule works for reduce and expand modes because of how
@@ -766,6 +769,28 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 return false;
             });
         }
+        } else {
+            // Flag gate: a sender posts this channel's flag only after flushing its
+            // data puts, so flag >= combine_iteration means that sender's puts for
+            // this channel have landed. One lane polls one sender.
+            if (lane_idx < kNumScaleoutRanks and lane_idx != scaleout_rank_idx) {
+                const auto flag_ptr = workspace_layout.get_combine_gate_flag_ptr(channel_idx, lane_idx);
+                comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
+                    const auto flag = ptx::ld_acquire_sys(flag_ptr);
+                    // Wrap-safe comparison: holds across uint32 overflow
+                    if (static_cast<int32_t>(flag - static_cast<uint32_t>(combine_iteration)) >= 0)
+                        return true;
+
+                    if (is_last_check) {
+                        printf("DeepEP combine (flag gate) timeout, scale-out: %d/%d, scale-up: %d/%d, "
+                               "channel: %d, sender: %d, flag: %u, iteration: %d\n",
+                               scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
+                               channel_idx, lane_idx, flag, combine_iteration);
+                    }
+                    return false;
+                });
+            }
+        }
         __syncwarp();
     } else {
         // Proxy warp loop shape: arch-selected at JIT compile time.
@@ -823,19 +848,43 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                                 tail[forward_warp_idx] == ptx::ld_acquire_cta(proxy_ring_layout.get_head(forward_warp_idx))) {
                                 ring_done[forward_warp_idx] = true;
                                 ++ num_forward_warps_done_cnt;
+                                if constexpr (kUseFlagGate) {
+                                    // Flush this ring's data puts, then publish the
+                                    // iteration flag into this rank's slot on every
+                                    // rail peer.
+                                    gin_ctx[forward_warp_idx].flush();
+                                    const auto flag_channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
+                                    const auto flag_ptr = workspace_layout.get_combine_gate_flag_ptr(
+                                        flag_channel_idx, scaleout_rank_idx);
+                                    for (int dst_rank_idx = 0; dst_rank_idx < kNumScaleoutRanks; ++ dst_rank_idx)
+                                        if (dst_rank_idx != scaleout_rank_idx)
+                                            gin_ctx[forward_warp_idx].put_value<ncclTeamTagRail>(
+                                                flag_ptr, static_cast<uint32_t>(combine_iteration), dst_rank_idx);
+                                }
                             }
                             continue;
                         }
 
                         const auto& desc = proxy_ring_layout.get_ring(forward_warp_idx)[
                             tail[forward_warp_idx] % static_cast<unsigned>(kProxyRingDepth)];
-                        gin_ctx[forward_warp_idx].put<ncclTeamTagRail>(
-                            desc.recv_ptr, desc.send_ptr,
-                            desc.num_bytes,
-                            desc.dst,
-                            0, /*flags=0*/
-                            ncclGin_SignalAdd{ring_signal_id[forward_warp_idx], static_cast<uint64_t>(1)}
-                        );
+                        if constexpr (kUseFlagGate) {
+                            // Flag gate: no per-put remote action; delivery is
+                            // announced by the post-flush iteration flag.
+                            gin_ctx[forward_warp_idx].put<ncclTeamTagRail>(
+                                desc.recv_ptr, desc.send_ptr,
+                                desc.num_bytes,
+                                desc.dst,
+                                0 /*flags=0*/
+                            );
+                        } else {
+                            gin_ctx[forward_warp_idx].put<ncclTeamTagRail>(
+                                desc.recv_ptr, desc.send_ptr,
+                                desc.num_bytes,
+                                desc.dst,
+                                0, /*flags=0*/
+                                ncclGin_SignalAdd{ring_signal_id[forward_warp_idx], static_cast<uint64_t>(1)}
+                            );
+                        }
 
                         ++ tail[forward_warp_idx];
                         ptx::st_release_cta(proxy_ring_layout.get_tail(forward_warp_idx), tail[forward_warp_idx]);
@@ -874,16 +923,39 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     }
 
                     const auto& desc = ring[tail % static_cast<unsigned>(kProxyRingDepth)];
-                    gin.put<ncclTeamTagRail>(
-                        desc.recv_ptr, desc.send_ptr,
-                        desc.num_bytes,
-                        desc.dst,
-                        0, /*flags=0*/
-                        ncclGin_SignalAdd{signal_id, static_cast<uint64_t>(1)}
-                    );
+                    if constexpr (kUseFlagGate) {
+                        // Flag gate: no per-put remote action; delivery is
+                        // announced by the post-flush iteration flag.
+                        gin.put<ncclTeamTagRail>(
+                            desc.recv_ptr, desc.send_ptr,
+                            desc.num_bytes,
+                            desc.dst,
+                            0 /*flags=0*/
+                        );
+                    } else {
+                        gin.put<ncclTeamTagRail>(
+                            desc.recv_ptr, desc.send_ptr,
+                            desc.num_bytes,
+                            desc.dst,
+                            0, /*flags=0*/
+                            ncclGin_SignalAdd{signal_id, static_cast<uint64_t>(1)}
+                        );
+                    }
 
                     ptx::st_release_cta(proxy_ring_layout.get_tail(lane_idx), tail + 1);
                     ++ tail;
+                }
+
+                if constexpr (kUseFlagGate) {
+                    // Flush outstanding data puts, then publish the iteration flag
+                    // into this rank's slot on every rail peer.
+                    gin.flush();
+                    const auto flag_ptr = workspace_layout.get_combine_gate_flag_ptr(
+                        channel_idx, scaleout_rank_idx);
+                    for (int dst_rank_idx = 0; dst_rank_idx < kNumScaleoutRanks; ++ dst_rank_idx)
+                        if (dst_rank_idx != scaleout_rank_idx)
+                            gin.put_value<ncclTeamTagRail>(
+                                flag_ptr, static_cast<uint32_t>(combine_iteration), dst_rank_idx);
                 }
             }
         }

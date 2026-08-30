@@ -43,6 +43,8 @@ class ElasticBuffer {
 
     // Workspace
     // NOTES: for all workspace, we must keep them as zeros
+    // (exception: the combine gate flags are monotonic counters — zeroed once at
+    // construction, never reset; see `get_combine_gate_flag_ptr`)
     void *workspace;
     void *host_workspace, *mapped_host_workspace;
     std::shared_ptr<layout::WorkspaceLayout> workspace_layout_wo_expert;
@@ -57,6 +59,8 @@ class ElasticBuffer {
     bool allow_multiple_reduction;
 
     mutable int dispatch_iteration = 0;
+
+    mutable int combine_iteration = 0;
 
     // Whether to prefer overlapping communication with compute (use more SMs and channels if false)
     bool prefer_overlap_with_compute;
@@ -1409,6 +1413,7 @@ public:
 
         // Push data into remote buffers
         // NOTES: we don't use `num_hidden_bytes` due to enable later quantization possibility
+        ++ combine_iteration;
         const auto reduce_buffer = launch_combine(
             x.data_ptr(),
             topk_weights.has_value() ? topk_weights->data_ptr() : nullptr,
@@ -1420,6 +1425,7 @@ public:
             nccl_context->dev_comm, nccl_context->window,
             buffer, workspace,
             num_reduced_tokens, num_combined_tokens,
+            combine_iteration,
             num_max_tokens_per_rank,
             hidden, num_experts, num_topk,
             num_qps, num_gpu_timeout_cycles,
