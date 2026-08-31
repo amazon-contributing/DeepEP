@@ -149,6 +149,15 @@ struct NCCLGin {
         gin.flush(coop_t());
     }
 
+    // Single-shot drain test: true once every put/putValue submitted on this
+    // context has a NIC completion. False means "not yet drained" — re-test
+    // later instead of blocking. Same drain condition as `flush()`.
+    template <typename coop_t = ncclCoopThread>
+    __device__ __forceinline__
+    bool try_flush() const {
+        return gin.flush(coop_t(), cuda::memory_order_acquire, ncclGin_None{}, 1) == ncclSuccess;
+    }
+
     template <typename team_t, typename coop_t = ncclCoopThread>
     __device__ __forceinline__
     void flush_async(const int& src_rank_idx, ncclGinRequest_t* request,

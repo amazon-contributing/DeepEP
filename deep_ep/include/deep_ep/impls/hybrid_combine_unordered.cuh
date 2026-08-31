@@ -58,7 +58,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     void* buffer, void* workspace,
                     const int scaleout_rank_idx, const int scaleup_rank_idx,
                     int num_reduced_tokens, const int num_combined_tokens,
-                    const int combine_iteration) {
+                    const uint32_t combine_iteration) {
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x);
     const auto thread_idx = static_cast<int>(threadIdx.x);
@@ -778,12 +778,12 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
                     const auto flag = ptx::ld_acquire_sys(flag_ptr);
                     // Wrap-safe comparison: holds across uint32 overflow
-                    if (static_cast<int32_t>(flag - static_cast<uint32_t>(combine_iteration)) >= 0)
+                    if (static_cast<int32_t>(flag - combine_iteration) >= 0)
                         return true;
 
                     if (is_last_check) {
                         printf("DeepEP combine (flag gate) timeout, scale-out: %d/%d, scale-up: %d/%d, "
-                               "channel: %d, sender: %d, flag: %u, iteration: %d\n",
+                               "channel: %d, sender: %d, flag: %u, iteration: %u\n",
                                scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
                                channel_idx, lane_idx, flag, combine_iteration);
                     }
@@ -820,6 +820,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 int num_forward_warps_done_cnt = 0;
                 unsigned tail[kNumForwardWarps] = {};
                 bool ring_done[kNumForwardWarps] = {};
+                // Flag mode only: ring has drained AND its flags are posted
+                bool ring_flushed[kNumForwardWarps] = {};
                 ncclGinSignal_t ring_signal_id[kNumForwardWarps];
 
                 alignas(handle::NCCLGin) unsigned char gin_ctx_storage[kNumForwardWarps * sizeof(handle::NCCLGin)];
@@ -838,8 +840,40 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
                     #pragma unroll
                     for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx) {
-                        if (ring_done[forward_warp_idx])
-                            continue;
+                        if constexpr (kUseFlagGate) {
+                            if (ring_flushed[forward_warp_idx])
+                                continue;
+                            if (ring_done[forward_warp_idx]) {
+                                // Publish the iteration flag once every operation this
+                                // context submitted has a NIC completion. Both flag-gate
+                                // invariants ride on that drain, and both are EFA GDA
+                                // properties stronger than the portable flush() contract
+                                // (which only promises source-buffer reuse):
+                                //   1. an SRD ACK means the write settled in remote
+                                //      memory, so a drained context implies this ring's
+                                //      puts are readable at every peer;
+                                //   2. the drain covers the putValue endpoint, so the
+                                //      previous iteration's flag is settled too — a
+                                //      delayed older flag can never overwrite a newer
+                                //      one in the receiver's slot.
+                                // Single-shot test so still-active rings keep sweeping.
+                                if (gin_ctx[forward_warp_idx].try_flush()) {
+                                    const auto flag_channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
+                                    const auto flag_ptr = workspace_layout.get_combine_gate_flag_ptr(
+                                        flag_channel_idx, scaleout_rank_idx);
+                                    for (int dst_rank_idx = 0; dst_rank_idx < kNumScaleoutRanks; ++ dst_rank_idx)
+                                        if (dst_rank_idx != scaleout_rank_idx)
+                                            gin_ctx[forward_warp_idx].put_value<ncclTeamTagRail>(
+                                                flag_ptr, combine_iteration, dst_rank_idx);
+                                    ring_flushed[forward_warp_idx] = true;
+                                    ++ num_forward_warps_done_cnt;
+                                }
+                                continue;
+                            }
+                        } else {
+                            if (ring_done[forward_warp_idx])
+                                continue;
+                        }
 
                         const unsigned head = ptx::ld_acquire_cta(proxy_ring_layout.get_head(forward_warp_idx));
 
@@ -847,20 +881,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                             if (ptx::ld_acquire_cta(proxy_ring_layout.get_done(forward_warp_idx)) == 1 and
                                 tail[forward_warp_idx] == ptx::ld_acquire_cta(proxy_ring_layout.get_head(forward_warp_idx))) {
                                 ring_done[forward_warp_idx] = true;
-                                ++ num_forward_warps_done_cnt;
-                                if constexpr (kUseFlagGate) {
-                                    // Flush this ring's data puts, then publish the
-                                    // iteration flag into this rank's slot on every
-                                    // rail peer.
-                                    gin_ctx[forward_warp_idx].flush();
-                                    const auto flag_channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
-                                    const auto flag_ptr = workspace_layout.get_combine_gate_flag_ptr(
-                                        flag_channel_idx, scaleout_rank_idx);
-                                    for (int dst_rank_idx = 0; dst_rank_idx < kNumScaleoutRanks; ++ dst_rank_idx)
-                                        if (dst_rank_idx != scaleout_rank_idx)
-                                            gin_ctx[forward_warp_idx].put_value<ncclTeamTagRail>(
-                                                flag_ptr, static_cast<uint32_t>(combine_iteration), dst_rank_idx);
-                                }
+                                if constexpr (not kUseFlagGate)
+                                    ++ num_forward_warps_done_cnt;
                             }
                             continue;
                         }
@@ -947,15 +969,16 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 }
 
                 if constexpr (kUseFlagGate) {
-                    // Flush outstanding data puts, then publish the iteration flag
-                    // into this rank's slot on every rail peer.
+                    // Blocking flush is fine here: each lane only stalls itself after
+                    // its own ring drains. The drain carries the two flag-gate
+                    // invariants documented at the sweeper's try_flush site above.
                     gin.flush();
                     const auto flag_ptr = workspace_layout.get_combine_gate_flag_ptr(
                         channel_idx, scaleout_rank_idx);
                     for (int dst_rank_idx = 0; dst_rank_idx < kNumScaleoutRanks; ++ dst_rank_idx)
                         if (dst_rank_idx != scaleout_rank_idx)
                             gin.put_value<ncclTeamTagRail>(
-                                flag_ptr, static_cast<uint32_t>(combine_iteration), dst_rank_idx);
+                                flag_ptr, combine_iteration, dst_rank_idx);
                 }
             }
         }

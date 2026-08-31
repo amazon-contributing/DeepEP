@@ -60,7 +60,7 @@ class ElasticBuffer {
 
     mutable int dispatch_iteration = 0;
 
-    mutable int combine_iteration = 0;
+    mutable uint32_t combine_iteration = 0;
 
     // Whether to prefer overlapping communication with compute (use more SMs and channels if false)
     bool prefer_overlap_with_compute;

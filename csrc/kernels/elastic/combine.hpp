@@ -59,7 +59,7 @@ public:
         int scaleout_rank_idx, scaleup_rank_idx;
         int num_reduced_tokens;
         int num_combined_tokens;
-        int combine_iteration;
+        uint32_t combine_iteration;
 
         jit::LaunchArgs launch_args;
     };
@@ -162,7 +162,7 @@ static void* launch_combine(void* x,
                             const jit::NoRefPtr& nccl_dev_comm, const ncclWindow_t& nccl_window,
                             void* buffer, void* workspace,
                             const int& num_reduced_tokens, const int& num_combined_tokens,
-                            const int& combine_iteration,
+                            const uint32_t& combine_iteration,
                             const int& num_max_tokens_per_rank,
                             const int& hidden,
                             const int& num_experts, const int& num_topk,
