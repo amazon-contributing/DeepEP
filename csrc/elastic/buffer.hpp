@@ -934,9 +934,13 @@ public:
             // `with_notify` is pinned (not `not cached_mode`) so a cached dispatch derives the
             // same count the handle was shaped with.
             if (num_sms > 0 and nccl_context->gin_config.gin_indexed_signals_cnt > 0) {
+                if (get_env<int>("EP_BUFFER_DEBUG"))
+                    printf("[DEBUG] DeepEP GIN requested channels per SM: %d\n", num_channels_per_sm);
                 num_channels_per_sm = elastic::gin_alloc::constexpr_channels_per_sm(
                     nccl_context->gin_config.gin_indexed_signals_cnt,
                     num_sms, num_qps, /*with_notify=*/true, num_channels_per_sm);
+                if (get_env<int>("EP_BUFFER_DEBUG"))
+                    printf("[DEBUG] DeepEP GIN resolved channels per SM: %d\n", num_channels_per_sm);
             }
             // The unordered combine also carves the proxy hand-off rings out of the
             // same dynamic shared memory as its TMA buffers; shrink the channel count
