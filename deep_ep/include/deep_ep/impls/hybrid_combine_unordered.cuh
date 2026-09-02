@@ -57,6 +57,20 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     void* buffer, void* workspace,
                     const int scaleout_rank_idx, const int scaleup_rank_idx,
                     int num_reduced_tokens, const int num_combined_tokens) {
+    // Guard `token_map_at_dispatch` bit packing: rank/slot/channel are ORed
+    // together with no masking in `pack_combine_recv_addr`, so a value that
+    // exceeds its field width bleeds into the neighbouring field silently.
+    // The `channel == channel_idx` assertion in the read-back stays intact
+    // when only slot overflows (channel is the lowest 12 bits), so nothing
+    // catches this at runtime; a compile-time gate keeps invalid template
+    // instantiations off the shelf.
+    EP_STATIC_ASSERT(kNumScaleoutRanks <= (1 << kCombineRecvMapRankBits),
+                     "kNumScaleoutRanks exceeds the 5-bit dst_scaleout_rank field in combine_recv_addr");
+    EP_STATIC_ASSERT(kNumMaxTokensPerChannel * kNumTopk <= (1 << kCombineRecvMapSlotBits),
+                     "kNumMaxTokensPerChannel * kNumTopk exceeds the 14-bit slot field in combine_recv_addr");
+    EP_STATIC_ASSERT(kNumChannels <= (1 << kCombineRecvMapChannelBits),
+                     "kNumChannels exceeds the 12-bit channel field in combine_recv_addr");
+
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x);
     const auto thread_idx = static_cast<int>(threadIdx.x);

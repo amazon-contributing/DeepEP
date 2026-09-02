@@ -178,6 +178,19 @@ hybrid_unordered_dispatch_impl(
     EP_STATIC_ASSERT(kNumScaleoutWarps == kNumForwardWarps, "Invalid warp size");
     EP_STATIC_ASSERT(kNumParts <= layout::WorkspaceLayout::kNumMaxParts,
                      "kNumParts exceeds the per-part header workspace capacity");
+
+    // Guard the `token_map_at_dispatch` bit packing this kernel writes into
+    // (see `pack_combine_recv_addr` and its callsite below). Rank/slot/channel
+    // are ORed together with no masking, so an out-of-range value bleeds into
+    // the neighbouring field silently — and the receiver's channel == channel_idx
+    // assertion doesn't catch slot-overflow because the channel bits stay intact.
+    // Refuse to instantiate a template combination that could produce that.
+    EP_STATIC_ASSERT(kNumScaleoutRanks <= (1 << kCombineRecvMapRankBits),
+                     "kNumScaleoutRanks exceeds the 5-bit dst_scaleout_rank field in combine_recv_addr");
+    EP_STATIC_ASSERT(kNumMaxTokensPerChannel * kNumTopk <= (1 << kCombineRecvMapSlotBits),
+                     "kNumMaxTokensPerChannel * kNumTopk exceeds the 14-bit slot field in combine_recv_addr");
+    EP_STATIC_ASSERT(kNumChannels <= (1 << kCombineRecvMapChannelBits),
+                     "kNumChannels exceeds the 12-bit channel field in combine_recv_addr");
     EP_STATIC_ASSERT(kNumParts >= 1, "Invalid part count");
     EP_STATIC_ASSERT(kNumSubParts >= 1, "Invalid sub-part count");
     EP_STATIC_ASSERT(kNumSubParts <= kBatchSize,
