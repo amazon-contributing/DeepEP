@@ -136,11 +136,6 @@ __forceinline__ __device__ __host__ constexpr GinPartAllocation compute_part_all
                                                       alloc.num_channels_per_sm)) * alloc.num_parts > gin_signals)
         --alloc.num_channels_per_sm;
 #ifndef __CUDA_ARCH__
-    if (alloc.num_channels_per_sm < num_channels_per_sm)
-        printf("[WARN] DeepEP GIN signal budget reduced the number of channels per SM "
-               "from %d to %d\n", num_channels_per_sm, alloc.num_channels_per_sm);
-#endif
-#ifndef __CUDA_ARCH__
     EP_HOST_ASSERT(static_cast<long long>(channels_per_context(num_sms, num_available_qps,
                                                                alloc.num_channels_per_sm)) * alloc.num_parts <= gin_signals and
                    "GIN signal budget cannot host even 1 part-signal per channel "
