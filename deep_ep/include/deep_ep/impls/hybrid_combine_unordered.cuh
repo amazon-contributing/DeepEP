@@ -188,6 +188,11 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         #pragma unroll
         for (int i = 0; i < kNumScaleupRanksPerLane; ++ i)
             stored_token_idx[i] = -1;
+        #pragma unroll 1
+        for (int sweep = 0; sweep < 2; ++ sweep) {
+        #pragma unroll
+        for (int i = 0; i < kNumScaleupRanksPerLane; ++ i)
+            stored_ll_idx[i] = 0;
         while (true) {
             // Load token indices in the list
             #pragma unroll
@@ -211,10 +216,18 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             // Process tokens for all ranks together using bitmask to skip inactive ranks
             EP_STATIC_ASSERT(kNumScaleupRanks <= 64, "Too many scale-up ranks for 64-bit mask");
             using mask_t = std::conditional_t<(kNumScaleupRanks <= 32), uint32_t, uint64_t>;
+            constexpr int kSweepMetadataStride = 2 + kNumTopk;
             mask_t wip_mask = 0;
             #pragma unroll
-            for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
-                wip_mask |= static_cast<mask_t>(ptx::gather(stored_token_idx[j] >= 0)) << (j * 32);
+            for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
+                bool in_sweep = stored_token_idx[j] >= 0;
+                if (in_sweep) {
+                    const auto src_global = __ldg(src_metadata + stored_token_idx[j] * kSweepMetadataStride);
+                    const bool is_local = (src_global / (kNumMaxTokensPerRank * kNumScaleupRanks)) == scaleout_rank_idx;
+                    in_sweep = (sweep == 0) != is_local;
+                }
+                wip_mask |= static_cast<mask_t>(ptx::gather(in_sweep)) << (j * 32);
+            }
             while (wip_mask) {
                 // Find next active rank after `dst_scaleup_rank_idx` (round-robin)
                 const auto start = (dst_scaleup_rank_idx + 1) % kNumScaleupRanks;
@@ -382,6 +395,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
         // Update for the unissued ones
         update_tails(true);
+        }
     } else if (warp_idx < kNumDataWarps) {
         const auto forward_warp_idx = warp_idx - kNumScaleupWarps;
         const auto channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
@@ -468,6 +482,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
         // Replay the dispatch
         int stored_num_tokens_recv[kNumScaleupRanksPerLane] = {}, stored_cached_scaleup_tail[kNumScaleupRanksPerLane] = {};
+        #pragma unroll 1
+        for (int replay_pass = 0; replay_pass < 2; ++ replay_pass) {
         for (int i = 0; ; ++ i) {
             const auto src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
             const auto src_rank_idx = src_token_global_idx / kNumMaxTokensPerRank;
@@ -479,6 +495,10 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims + 2 + kNumTopk + lane_idx) : -1;
             if (src_token_global_idx < 0)
                 break;
+
+            // Two-pass schedule: deferred tokens are revisited by the other pass
+            if ((replay_pass == 0) == (src_scaleout_rank_idx == scaleout_rank_idx))
+                continue;
 
             // Scaleup rank mask
             EP_STATIC_ASSERT(kNumScaleupRanks <= 64, "Too many scale-up peers");
@@ -648,6 +668,18 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 last_src_scaleout_rank_idx = src_scaleout_rank_idx;
                 last_slot_written = recv_slot;
             }
+        }
+
+        if (replay_pass == 0) {
+            flush_last_tma_and_record_batch();
+            last_src_scaleout_rank_idx = -1;
+            if (ptx::elect_one_sync()) {
+                #pragma unroll
+                for (int dst = 0; dst < kNumScaleoutRanks; ++ dst)
+                    issue_batched_rdma(dst);
+            }
+            __syncwarp();
+        }
         }
 
         // Issue the last TMA and record operation for last RDMA
