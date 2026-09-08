@@ -134,7 +134,9 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     // TODO: support more cases, or try to make channel count more aligned
     const bool kAdjustRegisters = (kNumChannelsPerSM == 4 or kNumChannelsPerSM == 8) and not kUseExpandedLayout;
     constexpr int kNumRegistersForScaleupWarps = 40;
-    constexpr int kNumRegistersForForwardWarps = 256 - kNumRegistersForScaleupWarps;
+    constexpr int kNumRegistersForWarpPair = (kNumChannelsPerSM == 8) ? 192 : 256;
+    constexpr int kNumRegistersForForwardWarps =
+        kNumRegistersForWarpPair - kNumRegistersForScaleupWarps;
 
     // Different warp roles
     if (warp_idx < kNumScaleupWarps) {
