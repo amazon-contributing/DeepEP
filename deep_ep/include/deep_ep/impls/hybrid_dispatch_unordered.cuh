@@ -55,6 +55,12 @@ static constexpr int kMinSubTokensDefault = (EP_MIN_SUB_TOKENS) > 1 ? (EP_MIN_SU
 #define EP_SM100_MIN_SUB_TOKENS 15
 #endif
 
+#ifndef EP_MIN_TOKENS_PER_PART
+#define EP_MIN_TOKENS_PER_PART 15
+#endif
+
+static constexpr int kMinTokensPerPart = (EP_MIN_TOKENS_PER_PART) > 1 ? (EP_MIN_TOKENS_PER_PART) : 1;
+
 template <int kNumSubParts, int kMinSubTokens = kMinSubTokensDefault>
 __device__ __host__ __forceinline__ int num_sub_parts_at(const int& part_tokens) {
     if constexpr (kNumSubParts <= 1) {
@@ -140,9 +146,13 @@ template <bool kDoCPUSync,
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
           int kNumChannelsPerSM = kNumScaleoutWarps,
           int kNumChannels = kNumScaleoutWarps * kNumSMs,
-          int kNumParts = gin_alloc::constexpr_num_parts(
-              kNumGinSignals, kNumSMs, kNumQPs, (kNumNotifyWarps > 0), kNumScaleoutWarps),
           int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank, kNumChannels),
+          int kNumBudgetParts = gin_alloc::constexpr_num_parts(
+              kNumGinSignals, kNumSMs, kNumQPs, (kNumNotifyWarps > 0), kNumScaleoutWarps),
+          int kNumGeomParts = kMinTokensPerPart <= 1 ? kNumBudgetParts
+                            : ((kNumMaxTokensPerChannel / kMinTokensPerPart > 1)
+                               ? kNumMaxTokensPerChannel / kMinTokensPerPart : 1),
+          int kNumParts = kNumBudgetParts < kNumGeomParts ? kNumBudgetParts : kNumGeomParts,
           int kPartSize = math::constexpr_ceil_div(kNumMaxTokensPerChannel, kNumParts),
           int kBatchSize = kPartSize,
           int kNumSubParts = kNumSubPartsDefault < kBatchSize ? kNumSubPartsDefault : kBatchSize,
