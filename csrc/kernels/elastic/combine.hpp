@@ -40,6 +40,7 @@ public:
         int num_topk;
         int num_qps;
         int64_t num_timeout_cycles;
+        int num_fw_warps_per_channel;
 
         // Parameters
         nv_bfloat16* x;
@@ -77,7 +78,7 @@ public:
                                     args.num_qps, args.num_timeout_cycles);
         } else {
             header_name = args.use_ordered_kernel ? "hybrid_combine" : "hybrid_combine_unordered";
-            func_name = fmt::format("{}<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("{}<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}{}>",
                                     args.use_ordered_kernel ? "hybrid_combine_impl" : "hybrid_unordered_combine_impl",
                                     args.use_expanded_layout, args.allow_multiple_reduction,
                                     args.launch_args.grid_dim.first,
@@ -88,7 +89,9 @@ public:
                                     args.num_experts,
                                     args.num_topk,
                                     args.num_qps,
-                                    args.num_timeout_cycles);
+                                    args.num_timeout_cycles,
+                                    args.use_ordered_kernel ? std::string() :
+                                        fmt::format(", {}", args.num_fw_warps_per_channel));
         }
         return fmt::format(R"(
 #include <deep_ep/impls/{}.cuh>
@@ -163,6 +166,7 @@ static void* launch_combine(void* x,
                             const int& num_sms, const int& num_smem_bytes,
                             const int& num_channels,
                             const bool& use_expanded_layout, const bool& allow_multiple_reduction,
+                            const bool& prefer_overlap_with_compute,
                             const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
@@ -171,6 +175,7 @@ static void* launch_combine(void* x,
     // Decide warps
     const bool use_ordered_kernel = use_ordered_hybrid_kernel();
     int num_scaleup_warps = 0, num_forward_warps = 0;
+    int args_num_fw_warps_per_channel = 1;
     if (num_scaleout_ranks > 1) {
         EP_HOST_ASSERT(num_channels % num_sms == 0 and
                        "Invalid number of channels or SMs, you may use a different SM count than dispatch");
@@ -185,7 +190,11 @@ static void* launch_combine(void* x,
                            "Invalid combine SM count, please try to match your dispatch config");
         } else {
             const auto num_data_warps = num_scaleup_warps + num_forward_warps;
-            num_warps = num_data_warps + 1;
+            const int num_fw_warps_per_channel =
+                (allow_multiple_reduction and not use_expanded_layout and
+                 not prefer_overlap_with_compute and
+                 (num_scaleup_warps + 2 * num_forward_warps + 1) * 32 <= 1024) ? 2 : 1;
+            num_warps = num_scaleup_warps + num_forward_warps * num_fw_warps_per_channel + 1;
             EP_HOST_ASSERT(num_warps * 32 <= 1024 and
                            "combine warp count (scale-up + forward + proxy) exceeds the "
                            "1024-thread block limit; use at least num_channels / 15 SMs");
@@ -196,9 +205,11 @@ static void* launch_combine(void* x,
             const int64_t tma_smem_bytes = static_cast<int64_t>(num_data_warps) * token_layout.get_num_bytes<true>();
             const int64_t proxy_ring_bytes = deep_ep::elastic::ProxyRingLayout::get_num_bytes(
                 num_forward_warps, deep_ep::elastic::kProxyRingDepthDefault);
+            const int64_t pair_sync_bytes = static_cast<int64_t>(2 * num_forward_warps) * sizeof(int);
             // The channel auto-tuner should prevent this assert from firing; leaving it as a sanity check.
-            EP_HOST_ASSERT(tma_smem_bytes + proxy_ring_bytes <= num_smem_bytes and
+            EP_HOST_ASSERT(tma_smem_bytes + proxy_ring_bytes + pair_sync_bytes <= num_smem_bytes and
                            "Combine TMA buffers + proxy rings exceed per-block shared memory");
+            args_num_fw_warps_per_channel = num_fw_warps_per_channel;
         }
     }
 
@@ -216,6 +227,7 @@ static void* launch_combine(void* x,
         .num_experts = num_experts,
         .num_topk = num_topk,
         .num_qps = num_qps, .num_timeout_cycles = num_timeout_cycles,
+        .num_fw_warps_per_channel = args_num_fw_warps_per_channel,
         .x = static_cast<nv_bfloat16*>(x),
         .topk_weights = static_cast<float*>(topk_weights),
         .src_metadata = src_metadata,

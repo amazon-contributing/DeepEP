@@ -47,13 +47,13 @@ struct GinResourceConfig {
 static constexpr int kMinGinContextCnt           = 2;
 static constexpr int kMaxGinContextCnt           = kMaxGinContextBudget;
 
-// Default context count (== default QP count). 11 contexts -> 21 signals/context.
+// Default context count (== default QP count). 13 contexts -> 17 signals/context.
 // Contexts and signals-per-context are inversely coupled through
 // `gin_indexed_signals_for`, so more QPs means a smaller per-context signal budget. The
 // equivalent alternatives are {5, 6, 7, 8, 9, 14}; everything else loses a part somewhere.
 // Notably 12, 15, 16 and 17 all drop to 3 parts at 12 SMs -- 17 (the provider maximum) leaves
 // only 13 signals/context, and its per-SM QP split puts 4 channels on the busiest QP.
-static constexpr int kDefaultGinContextCnt       = 11;
+static constexpr int kDefaultGinContextCnt       = 13;
 
 // Per-context indexed-signal budget, workaround for current limitations in provider.
 __forceinline__ __device__ __host__ constexpr int gin_indexed_signals_for(int gin_context_cnt) {
