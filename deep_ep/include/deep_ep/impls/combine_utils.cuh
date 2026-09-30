@@ -34,6 +34,12 @@ constexpr int kCombineRecvMapRankMask    = (1 << kCombineRecvMapRankBits) - 1;
 constexpr int kCombineRecvMapSlotShift    = kCombineRecvMapChannelBits;
 constexpr int kCombineRecvMapRankShift    = kCombineRecvMapChannelBits + kCombineRecvMapSlotBits;
 
+// Callers of `pack_combine_recv_addr` are expected to ensure rank/slot/channel
+// fit in 5/14/12 bits respectively (kCombineRecvMap*Bits). No runtime mask is
+// applied, so an out-of-range value bleeds into the neighbouring field silently
+// — and `pack_combine_recv_addr`'s receiver checks only match on the channel
+// bits. The two hybrid unordered kernels enforce these bounds at compile time
+// on the template arguments they instantiate this with.
 __device__ __host__ __forceinline__
 int pack_combine_recv_addr(const int& rank, const int& slot, const int& channel) {
     return (rank << kCombineRecvMapRankShift) | (slot << kCombineRecvMapSlotShift) | channel;
