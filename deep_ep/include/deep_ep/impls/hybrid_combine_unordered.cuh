@@ -818,12 +818,21 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             handle::NCCLGin rail_ctx(nccl_dev_comm, nccl_window, rail_qp, rail_mode);
 
             while (num_forward_warps_done_cnt < kNumForwardWarps) {
-                int gin_put_ops = 0;
+                // Two passes, so the round's last put -- the one that rings the doorbell -- is
+                // known before any put is issued.
+
+                // Pass 1: count what each ring holds.
+                int pending_count[kNumForwardWarps] = {};
+                int total_pending = 0;
+                // Once any warp is done, stop holding rounds back and drain every sweep.
+                bool any_ring_finished = false;
 
                 #pragma unroll
                 for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx) {
-                    if (ring_done[forward_warp_idx])
+                    if (ring_done[forward_warp_idx]) {
+                        any_ring_finished = true;
                         continue;
+                    }
 
                     const unsigned head = ptx::ld_acquire_cta(proxy_ring_layout.get_head(forward_warp_idx));
 
@@ -832,27 +841,67 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                             tail[forward_warp_idx] == ptx::ld_acquire_cta(proxy_ring_layout.get_head(forward_warp_idx))) {
                             ring_done[forward_warp_idx] = true;
                             ++ num_forward_warps_done_cnt;
+                            any_ring_finished = true;
                         }
                         continue;
                     }
 
-                    const auto& desc = proxy_ring_layout.get_ring(forward_warp_idx)[
-                        tail[forward_warp_idx] % static_cast<unsigned>(kProxyRingDepth)];
-                    rail_ctx.put<ncclTeamTagRail>(
-                        desc.recv_ptr, desc.send_ptr,
-                        desc.num_bytes,
-                        desc.dst,
-                        0, /*flags=0*/
-                        ncclGin_SignalAdd{rail_signal_id, static_cast<uint64_t>(1)}
-                    );
+                    // Unsigned subtraction, correct across wrap; bounded by kProxyRingDepth.
+                    pending_count[forward_warp_idx] = static_cast<int>(head - tail[forward_warp_idx]);
+                    total_pending += pending_count[forward_warp_idx];
 
-                    ++ tail[forward_warp_idx];
-                    ptx::st_release_cta(proxy_ring_layout.get_tail(forward_warp_idx), tail[forward_warp_idx]);
-                    ++ gin_put_ops;
+                    // A non-empty ring can still have a finished producer.
+                    if (ptx::ld_acquire_cta(proxy_ring_layout.get_done(forward_warp_idx)) != 0)
+                        any_ring_finished = true;
                 }
 
-                if (gin_put_ops == 0)
+                // Wait for one descriptor per forward warp, then send them all under one
+                // doorbell. A floor, not a cap. Exempt in the tail, which would wait forever.
+                const bool drain_now = total_pending > 0 and
+                                       (total_pending >= kNumForwardWarps or any_ring_finished);
+
+                const auto issue_put = [&](const ProxyPutDesc& d, const int& ring_idx,
+                                           const bool& ring_doorbell) {
+                    rail_ctx.put<ncclTeamTagRail>(
+                        d.recv_ptr, d.send_ptr,
+                        d.num_bytes,
+                        d.dst,
+                        ring_doorbell ? 0 : ncclGinOptFlagsAggregateRequests,
+                        ncclGin_SignalAdd{rail_signal_id, static_cast<uint64_t>(1)}
+                    );
+                    ++ tail[ring_idx];
+                    ptx::st_release_cta(proxy_ring_layout.get_tail(ring_idx), tail[ring_idx]);
+                };
+
+                if (not drain_now) {
                     __nanosleep(1000);
+                    continue;
+                }
+
+                // Pass 2: drain the whole snapshot. Anything queued mid-round waits for the next.
+                //
+                // Issuing lags one descriptor behind the scan so each put knows the next put's
+                // destination. A deferred doorbell only covers one destination -- GDAKI gives each
+                // peer its own QP, hence its own doorbell -- so a destination change must ring.
+                ProxyPutDesc pend{};
+                int pend_ring = -1;
+                #pragma unroll
+                for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx) {
+                    // Fixed base: `issue_put` advances `tail[forward_warp_idx]` for the descriptor
+                    // held back, which trails this scan by one.
+                    const unsigned read_base = tail[forward_warp_idx];
+                    for (int k = 0; k < pending_count[forward_warp_idx]; ++ k) {
+                        const ProxyPutDesc desc = proxy_ring_layout.get_ring(forward_warp_idx)[
+                            (read_base + static_cast<unsigned>(k)) % static_cast<unsigned>(kProxyRingDepth)];
+                        if (pend_ring >= 0)
+                            issue_put(pend, pend_ring, pend.dst != desc.dst);
+                        pend = desc;
+                        pend_ring = forward_warp_idx;
+                    }
+                }
+                // `drain_now` guarantees a descriptor was scanned. The round's last put always
+                // rings, so no WQE is left un-rung.
+                issue_put(pend, pend_ring, true);
             }
 
             // Wait for all arrivals from the peer rail SMs.
