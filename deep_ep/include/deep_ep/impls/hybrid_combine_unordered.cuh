@@ -770,125 +770,63 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         }
         __syncwarp();
     } else {
-        // Proxy warp loop shape: arch-selected at JIT compile time.
-        //   SM100+ (B200) -> sequential single-lane sweeper.
-        //   otherwise (H200) -> parallel multi-lane (each lane owns its ring).
-        //
-        // B200 forward warps run faster so batches arrive at the proxy unevenly,
-        // driving high lane divergence in the parallel design. H200 forward warps
-        // are slower, so batches arrive more evenly and most lanes have work
-        // together -> low divergence.
-        //
-        // Divergence cost per put step: sum(Ln for n in 0..kNumForwardWarps-1)
-        // (all lanes' PC time) + lane-context-switch overhead. On B200 that beats
-        // the serial sweep; on H200 the parallel throughput gain dominates.
-        #if __CUDA_ARCH__ >= 1000
-        constexpr bool kSingleLaneSweeper = true;
-        #else
-        constexpr bool kSingleLaneSweeper = false;
-        #endif
+        if (ptx::elect_one_sync()) {
+            int num_forward_warps_done_cnt = 0;
+            unsigned tail[kNumForwardWarps] = {};
+            bool ring_done[kNumForwardWarps] = {};
+            // A single thread in a single warp posts for the whole SM, using one GIN context
+            // and one indexed signal.
+            const auto rail_signal_id = static_cast<ncclGinSignal_t>(
+                comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, 0));
 
-        if constexpr (kSingleLaneSweeper) {
-            // Sequential design: one lane sweeps all rings, issues puts serially.
-            // Owns per-ring GIN contexts (built inline so each put routes to its
-            // channel's QP). Best when per-put cost is high enough that warp-lockstep
-            // parallelism doesn't pay off (B200 SM100).
-            if (ptx::elect_one_sync()) {
-                int num_forward_warps_done_cnt = 0;
-                unsigned tail[kNumForwardWarps] = {};
-                bool ring_done[kNumForwardWarps] = {};
-                ncclGinSignal_t ring_signal_id[kNumForwardWarps];
+            // Either THREAD or GPU. One lane in one warp posts, so CTA is unnecessary and
+            // THREAD is more efficient.
+            const auto [rail_qp, mapped_mode] =
+                comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, 0);
+            const auto rail_mode = mapped_mode == NCCL_GIN_RESOURCE_SHARING_GPU
+                                 ? NCCL_GIN_RESOURCE_SHARING_GPU
+                                 : NCCL_GIN_RESOURCE_SHARING_THREAD;
+            handle::NCCLGin rail_ctx(nccl_dev_comm, nccl_window, rail_qp, rail_mode);
 
-                alignas(handle::NCCLGin) unsigned char gin_ctx_storage[kNumForwardWarps * sizeof(handle::NCCLGin)];
-                auto* const gin_ctx = reinterpret_cast<handle::NCCLGin*>(gin_ctx_storage);
+            while (num_forward_warps_done_cnt < kNumForwardWarps) {
+                int gin_put_ops = 0;
+
                 #pragma unroll
                 for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx) {
-                    ring_signal_id[forward_warp_idx] = static_cast<ncclGinSignal_t>(
-                        comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
-                    const auto [qp, mode] =
-                        comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx);
-                    new (&gin_ctx[forward_warp_idx]) handle::NCCLGin(nccl_dev_comm, nccl_window, qp, mode);
-                }
+                    if (ring_done[forward_warp_idx])
+                        continue;
 
-                while (num_forward_warps_done_cnt < kNumForwardWarps) {
-                    int gin_put_ops = 0;
+                    const unsigned head = ptx::ld_acquire_cta(proxy_ring_layout.get_head(forward_warp_idx));
 
-                    #pragma unroll
-                    for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx) {
-                        if (ring_done[forward_warp_idx])
-                            continue;
-
-                        const unsigned head = ptx::ld_acquire_cta(proxy_ring_layout.get_head(forward_warp_idx));
-
-                        if (tail[forward_warp_idx] == head) {
-                            if (ptx::ld_acquire_cta(proxy_ring_layout.get_done(forward_warp_idx)) == 1 and
-                                tail[forward_warp_idx] == ptx::ld_acquire_cta(proxy_ring_layout.get_head(forward_warp_idx))) {
-                                ring_done[forward_warp_idx] = true;
-                                ++ num_forward_warps_done_cnt;
-                            }
-                            continue;
-                        }
-
-                        const auto& desc = proxy_ring_layout.get_ring(forward_warp_idx)[
-                            tail[forward_warp_idx] % static_cast<unsigned>(kProxyRingDepth)];
-                        gin_ctx[forward_warp_idx].put<ncclTeamTagRail>(
-                            desc.recv_ptr, desc.send_ptr,
-                            desc.num_bytes,
-                            desc.dst,
-                            0, /*flags=0*/
-                            ncclGin_SignalAdd{ring_signal_id[forward_warp_idx], static_cast<uint64_t>(1)}
-                        );
-
-                        ++ tail[forward_warp_idx];
-                        ptx::st_release_cta(proxy_ring_layout.get_tail(forward_warp_idx), tail[forward_warp_idx]);
-                        ++ gin_put_ops;
-                    }
-
-                    if (gin_put_ops == 0)
-                        __nanosleep(1000);
-                }
-            }
-            __syncwarp();
-        } else {
-            // Parallel design: each lane represents one forward warp within this SM
-            // and drains its own ring. Warp-lockstep parallelism across up to
-            // kNumForwardWarps lanes — best when per-put cost is small (H200 SM90).
-            if (lane_idx < kNumForwardWarps) {
-                const auto channel_idx = sm_idx * kNumChannelsPerSM + lane_idx;
-                const auto signal_id = static_cast<ncclGinSignal_t>(
-                    comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, lane_idx));
-
-                ProxyPutDesc* const ring = proxy_ring_layout.get_ring(lane_idx);
-                unsigned tail = 0;
-
-                while (true) {
-                    const unsigned head = ptx::ld_acquire_cta(proxy_ring_layout.get_head(lane_idx));
-                    if (tail == head) {
-                        if (ptx::ld_acquire_cta(proxy_ring_layout.get_done(lane_idx)) != 0) {
-                            // Re-check head to avoid missing a descriptor published just
-                            // before `done` became visible.
-                            if (tail == ptx::ld_acquire_cta(proxy_ring_layout.get_head(lane_idx)))
-                                break;
-                        } else if (tail != 0 and (tail % static_cast<unsigned>(kNumForwardWarps)) == 0) {
-                            __nanosleep(1000); // release context for data warps
+                    if (tail[forward_warp_idx] == head) {
+                        if (ptx::ld_acquire_cta(proxy_ring_layout.get_done(forward_warp_idx)) == 1 and
+                            tail[forward_warp_idx] == ptx::ld_acquire_cta(proxy_ring_layout.get_head(forward_warp_idx))) {
+                            ring_done[forward_warp_idx] = true;
+                            ++ num_forward_warps_done_cnt;
                         }
                         continue;
                     }
 
-                    const auto& desc = ring[tail % static_cast<unsigned>(kProxyRingDepth)];
-                    gin.put<ncclTeamTagRail>(
+                    const auto& desc = proxy_ring_layout.get_ring(forward_warp_idx)[
+                        tail[forward_warp_idx] % static_cast<unsigned>(kProxyRingDepth)];
+                    rail_ctx.put<ncclTeamTagRail>(
                         desc.recv_ptr, desc.send_ptr,
                         desc.num_bytes,
                         desc.dst,
                         0, /*flags=0*/
-                        ncclGin_SignalAdd{signal_id, static_cast<uint64_t>(1)}
+                        ncclGin_SignalAdd{rail_signal_id, static_cast<uint64_t>(1)}
                     );
 
-                    ptx::st_release_cta(proxy_ring_layout.get_tail(lane_idx), tail + 1);
-                    ++ tail;
+                    ++ tail[forward_warp_idx];
+                    ptx::st_release_cta(proxy_ring_layout.get_tail(forward_warp_idx), tail[forward_warp_idx]);
+                    ++ gin_put_ops;
                 }
+
+                if (gin_put_ops == 0)
+                    __nanosleep(1000);
             }
         }
+        __syncwarp();
     }
 
     // No barrier at epilogue
