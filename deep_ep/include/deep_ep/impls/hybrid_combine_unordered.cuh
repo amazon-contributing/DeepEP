@@ -20,6 +20,56 @@
 
 namespace deep_ep::elastic {
 
+// Iterate the whole forward metadata list and count how many tokens (forward slots) this channel
+// will send to each scale-out destination. Warp-wide: each lane scans a stride, then the per-lane
+// tallies are summed.
+template <bool kAllowMultipleReduction, bool kUseExpandedLayout,
+          int kNumScaleoutRanks, int kNumScaleupRanks, int kNumMaxTokensPerRank,
+          int kNumMaxTokensPerChannel, int kNumTopk, int kNumForwardMetadataDims>
+__device__ __forceinline__ void count_forward_slots_per_dst(
+        const int* token_metadata_at_forward, const int& lane_idx,
+        int (&out)[kNumScaleoutRanks]) {
+    for (int base = 0; ; base += 32) {
+        const int idx = base + lane_idx;
+        const bool in_range = idx < kNumScaleoutRanks * kNumMaxTokensPerChannel;
+        const int g = in_range
+            ? __ldg(token_metadata_at_forward + idx * kNumForwardMetadataDims) : -1;
+        // Lanes at or beyond the `-1` sentinel are past the end of the list.
+        const unsigned alive = ptx::gather(g >= 0);
+        const int first_dead = __ffs(static_cast<int>(~alive));
+        const int live_lanes = first_dead == 0 ? 32 : first_dead - 1;
+        if (lane_idx < live_lanes) {
+            const int dst = (g / kNumMaxTokensPerRank) / kNumScaleupRanks;
+            int slots = 1;
+            if constexpr (not kAllowMultipleReduction) {
+                int n = 0;
+                #pragma unroll
+                for (int k = 0; k < kNumTopk; ++ k) {
+                    const int v = __ldg(token_metadata_at_forward +
+                                        idx * kNumForwardMetadataDims + 2 + k);
+                    if (v < 0)
+                        continue;
+                    bool dup = false;
+                    if constexpr (not kUseExpandedLayout) {
+                        #pragma unroll
+                        for (int pk = 0; pk < k; ++ pk)
+                            dup |= (__ldg(token_metadata_at_forward +
+                                          idx * kNumForwardMetadataDims + 2 + pk) == v);
+                    }
+                    n += not dup;
+                }
+                slots = n;
+            }
+            out[dst] += slots;
+        }
+        if (live_lanes < 32)
+            break;
+    }
+    #pragma unroll
+    for (int d = 0; d < kNumScaleoutRanks; ++ d)
+        out[d] = ptx::reduce_add(out[d]);
+}
+
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumSMs,
           int kNumScaleupWarps, int kNumForwardWarps,
@@ -403,6 +453,21 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         token_metadata_at_forward += channel_idx * ((kNumScaleoutRanks * kNumMaxTokensPerChannel + 1) * kNumForwardMetadataDims);
 
         // Per Channel/ScaleOutRank batch metadata
+        // Slots this channel owes each scale-out peer, counted DOWN as they are recorded;
+        // reaching 0 means that destination is finished.
+        int num_slots_remaining_per_dst[kNumScaleoutRanks] = {};
+        count_forward_slots_per_dst<kAllowMultipleReduction, kUseExpandedLayout, kNumScaleoutRanks,
+                                    kNumScaleupRanks, kNumMaxTokensPerRank, kNumMaxTokensPerChannel,
+                                    kNumTopk, kNumForwardMetadataDims>(
+            token_metadata_at_forward, lane_idx, num_slots_remaining_per_dst);
+        __syncwarp();
+        // Slots this channel still owes remote peers in total; at 0 the ring can be retired.
+        int num_remote_slots_remaining = 0;
+        #pragma unroll
+        for (int d = 0; d < kNumScaleoutRanks; ++ d)
+            if (d != scaleout_rank_idx)
+                num_remote_slots_remaining += num_slots_remaining_per_dst[d];
+
         int batch_count[kNumScaleoutRanks] = {};
         int batch_start_slot[kNumScaleoutRanks];
 
@@ -444,8 +509,17 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             if (batch_count[dst] == 0)
                 batch_start_slot[dst] = slot;
             batch_count[dst] += 1;
-            if (batch_count[dst] == kBatchSize)
+
+            // A destination whose tokens are all handled will get no more, so forward its batch
+            // now instead of waiting for it to fill.
+            const bool dst_exhausted = (-- num_slots_remaining_per_dst[dst] == 0);
+            if (batch_count[dst] == kBatchSize or dst_exhausted)
                 issue_batched_rdma(dst);
+
+            // All tokens for every destination are used: tell the proxy immediately so it can
+            // stop waiting for more descriptors on this ring.
+            if (-- num_remote_slots_remaining == 0)
+                ptx::st_release_cta(proxy_ring_layout.get_done(forward_warp_idx), 1);
         };
 
         int last_src_scaleout_rank_idx = -1;
