@@ -388,13 +388,6 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         const auto forward_warp_idx = warp_idx - kNumScaleupWarps;
         const auto channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
 
-        // Indexed-signal id owned by this channel within its GIN context. Uses the
-        // companion helper to `get_qp_mode` (called at kernel entry) so the id is
-        // unique among all channels sharing this warp's QP, regardless of which of
-        // `get_qp_mode`'s branches picked the mapping.
-        const auto signal_id = static_cast<ncclGinSignal_t>(
-            comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
-
         // Adjust registers
         if constexpr (kAdjustRegisters)
             ptx::warpgroup_reg_alloc<kNumRegistersForForwardWarps>();
@@ -675,39 +668,32 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         }
         __syncwarp();
 
-        // Update, wait and clean
+    } else {
+        // Count the arrivals this SM must wait for.
+        //
+        // The rule is "distinct valid non-local packed entries per token", scanned out of
+        // `token_map_at_dispatch` -- my own outbound routing decisions during dispatch, which are
+        // exactly what the peers send back. Summed over all `kNumChannelsPerSM` channels of this SM.
+        // Full warp, before the electing thread takes over.
+        //
+        // Concrete example -- token T=0 on channel C, topK=4, my scaleout_rank_idx=3, routing
+        // (k=0 -> scaleout 1, k=1 -> scaleout 0, k=2 -> scaleout 0, k=3 -> scaleout 3):
+        //   Reduce mode (map = [pack(1,0,C), pack(0,0,C), pack(0,0,C), pack(3,0,C)]):
+        //     k=0 remote, first sight          -> count
+        //     k=1 remote, first sight          -> count
+        //     k=2 remote, duplicate of k=1     -> skip
+        //     k=3 == self, local bypass        -> skip
+        //   Expected puts for T=0 = 2; peer 0 sends one reduced partial covering k=1+k=2.
+        int sm_num_expected_arrivals = 0;
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Invalid ranks");
-
-        // Derive the expected inbound put count for this channel by counting my own
-        // outbound routing decisions during dispatch. Count "distinct valid non-local packed
-        // entries per T" — same rule works for reduce and expand modes because of how
-        // dispatch fills the map.
-        //
-        // Concrete example — token T=0 on channel C, topK=4, my scaleout_rank_idx=3,
-        // routing (k=0 → scaleout 1, k=1 → scaleout 0, k=2 → scaleout 0, k=3 → scaleout 3):
-        //
-        //   Reduce mode (map = [ pack(1,0,C), pack(0,0,C), pack(0,0,C), pack(3,0,C) ]):
-        //     k=0: valid, rank=1 (remote), first sight of pack(1,0,C)         → count
-        //     k=1: valid, rank=0 (remote), first sight of pack(0,0,C)         → count
-        //     k=2: valid, rank=0 (remote), pack(0,0,C) already seen (dup)     → skip
-        //     k=3: valid, rank=3 (== self, local-bypass, no put fires)        → skip
-        //   Expected puts for T=0 = 2. Peer R=0 sends one reduced partial covering k=1+k=2.
-        //
-        //   Expand mode (map = [ pack(1,0,C), pack(0,0,C), pack(0,1,C), pack(3,0,C) ]):
-        //     k=0: valid, rank=1 (remote), unique packed value  → count
-        //     k=1: valid, rank=0 (remote), unique packed value  → count
-        //     k=2: valid, rank=0 (remote), unique packed value  → count
-        //     k=3: valid, rank=3 (self)                          → skip
-        //   Expected puts for T=0 = 3. Peer R=0 sends two separate partials (k=1, k=2)
-        //   at distinct slots because each valid k has its own packed slot in expand mode.
-        int local_expected_count_per_rank[kNumScaleoutRanks] = {};
-        {
-            #pragma unroll
+        #pragma unroll
+        for (int c = 0; c < kNumChannelsPerSM; ++ c) {
+            const int scan_channel_idx = sm_idx * kNumChannelsPerSM + c;
+            int local_expected_count_per_rank[kNumScaleoutRanks] = {};
             for (int t_in_channel = lane_idx; t_in_channel < kNumMaxTokensPerChannel; t_in_channel += 32) {
-                const int token_idx = channel_idx + t_in_channel * kNumChannels;
+                const int token_idx = scan_channel_idx + t_in_channel * kNumChannels;
                 if (token_idx >= num_combined_tokens)
                     continue;
-                // Load this token's map entries once, then dedup+count within the topK block.
                 int packed_entries[kNumTopk];
                 #pragma unroll
                 for (int k = 0; k < kNumTopk; ++ k)
@@ -719,11 +705,9 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                         continue;
                     int rank, slot, channel;
                     unpack_combine_recv_addr(p, rank, slot, channel);
-                    // Sanity: token T dispatched by us with `T % kNumChannels == channel_idx`
-                    // must have its map entry's channel field equal to channel_idx.
-                    EP_DEVICE_ASSERT(channel == channel_idx);
+                    EP_DEVICE_ASSERT(channel == scan_channel_idx);
                     if (rank == scaleout_rank_idx)
-                        continue;   // local-bypass, no RDMA put
+                        continue;   // local bypass, no RDMA put comes back for it
                     bool is_duplicate = false;
                     #pragma unroll
                     for (int prior_k = 0; prior_k < k; ++ prior_k)
@@ -732,44 +716,15 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                         local_expected_count_per_rank[rank] += 1;
                 }
             }
-        }
-
-        // Each lane in the Forward warp (= channel) accumulated the expected tokens per scale-out
-        // rank in its own slice of the map. All-reduce across lanes so every lane sees
-        // the full per-rank total. Then divide by the batch size, that's the aggregation
-        // granularity we expect on the wire.
-        int num_expected_arrivals = 0;
-        #pragma unroll
-        for (int r = 0; r < kNumScaleoutRanks; ++ r) {
-            const int rank_total = ptx::reduce_add(local_expected_count_per_rank[r]);
-            num_expected_arrivals += math::ceil_div(rank_total, kBatchSize);
+            // Reduce across lanes BEFORE the ceil_div: batching happens per (peer, channel), not
+            // per lane, so dividing a lane's partial count would round up far too often.
+            #pragma unroll
+            for (int r = 0; r < kNumScaleoutRanks; ++ r)
+                sm_num_expected_arrivals +=
+                    math::ceil_div(ptx::reduce_add(local_expected_count_per_rank[r]), kBatchSize);
         }
         __syncwarp();
-        // Wait for the per-channel indexed signal to accumulate `num_expected_arrivals`
-        // increments from the remote senders. Bump the shadow by the expected delta to
-        // get the target count, then poll the actual signal until it catches up. only
-        // one lane polls. We poll with a timeout (instead of the blocking
-        // `waitSignalMeetShadow`) so a stuck peer surfaces a diagnostic rather than
-        // hanging.
-        if (ptx::elect_one_sync()) {
-            const auto shadow_ptr = gin.gin.getSignalShadowPtr(signal_id);
-            const auto target = (*shadow_ptr += static_cast<uint64_t>(num_expected_arrivals));
-            comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-                const auto signal = gin.gin.readSignal(signal_id, 64, cuda::memory_order_acquire);
-                if (signal >= target)
-                    return true;
 
-                if (is_last_check) {
-                    printf("DeepEP combine (scale-out wait all) timeout, scale-out: %d/%d, scale-up: %d/%d, "
-                           "channel: %d, signal: %lu, target: %lu\n",
-                           scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
-                           channel_idx, signal, target);
-                }
-                return false;
-            });
-        }
-        __syncwarp();
-    } else {
         if (ptx::elect_one_sync()) {
             int num_forward_warps_done_cnt = 0;
             unsigned tail[kNumForwardWarps] = {};
@@ -825,6 +780,25 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 if (gin_put_ops == 0)
                     __nanosleep(1000);
             }
+
+            // Wait for all arrivals from the peer rail SMs.
+            const auto shadow_ptr = rail_ctx.gin.getSignalShadowPtr(rail_signal_id);
+            const auto target = (*shadow_ptr += static_cast<uint64_t>(sm_num_expected_arrivals));
+            comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
+                const auto signal =
+                    rail_ctx.gin.readSignal(rail_signal_id, 64, cuda::memory_order_acquire);
+                if (signal >= target)
+                    return true;
+                if (is_last_check) {
+                    // SM-wide, not per channel: one signal now covers every channel of this SM, so
+                    // the per-channel attribution the old message printed no longer exists.
+                    printf("DeepEP combine (scale-out wait all) timeout, scale-out: %d/%d, "
+                           "scale-up: %d/%d, sm: %d, signal: %lu, target: %lu, expected: %d\n",
+                           scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
+                           sm_idx, signal, target, sm_num_expected_arrivals);
+                }
+                return false;
+            });
         }
         __syncwarp();
     }
