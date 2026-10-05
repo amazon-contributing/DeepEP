@@ -18,6 +18,10 @@
 #include <deep_ep/impls/combine_utils.cuh>
 #include <deep_ep/impls/proxy_ring.cuh>
 
+#ifndef EP_COMBINE_BATCH_SIZE
+#define EP_COMBINE_BATCH_SIZE 6
+#endif
+
 namespace deep_ep::elastic {
 
 // Iterate the whole forward metadata list and count how many tokens (forward slots) this channel
@@ -80,7 +84,7 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumQPs, int64_t kNumTimeoutCycles,
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
           int kNumScaleupUpdateInterval = 3,
-          int kBatchSize = 12,
+          int kBatchSize = EP_COMBINE_BATCH_SIZE,
           int kProxyRingDepth = kProxyRingDepthDefault,
           int kNumChannelsPerSM = kNumForwardWarps,
           int kNumChannels = kNumChannelsPerSM * kNumSMs,
