@@ -130,6 +130,10 @@ __device__ __host__ __forceinline__ constexpr int part_offset_at(const int& part
     return off;
 }
 
+// QP 0 carries the rail barrier's indexed signals. The data channels stay above QP 0 in
+// cached mode too (no notify warps), matching the host tuner and the combine kernel.
+static constexpr bool kDataChannelsAboveQP0 = true;
+
 template <bool kDoCPUSync,
           bool kReuseSlotIndices,
           bool kAllowMultipleReduction,
@@ -148,7 +152,7 @@ template <bool kDoCPUSync,
           int kNumChannels = kNumScaleoutWarps * kNumSMs,
           int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank, kNumChannels),
           int kNumBudgetParts = gin_alloc::constexpr_num_parts(
-              kNumGinSignals, kNumSMs, kNumQPs, (kNumNotifyWarps > 0), kNumScaleoutWarps),
+              kNumGinSignals, kNumSMs, kNumQPs, kDataChannelsAboveQP0, kNumScaleoutWarps),
           int kNumGeomParts = kMinTokensPerPart <= 1 ? kNumBudgetParts
                             : ((kNumMaxTokensPerChannel / kMinTokensPerPart > 1)
                                ? kNumMaxTokensPerChannel / kMinTokensPerPart : 1),
@@ -194,7 +198,7 @@ hybrid_unordered_dispatch_impl(
                      "More sub-parts than tokens in a part: every sub-part must own >= 1 token "
                      "so its header has its own slot");
     EP_STATIC_ASSERT(gin_alloc::constexpr_channels_per_sm(
-                         kNumGinSignals, kNumSMs, kNumQPs, (kNumNotifyWarps > 0), kNumScaleoutWarps)
+                         kNumGinSignals, kNumSMs, kNumQPs, kDataChannelsAboveQP0, kNumScaleoutWarps)
                          == kNumScaleoutWarps,
                      "GIN signal budget cannot host the launched channel count");
 
@@ -219,7 +223,7 @@ hybrid_unordered_dispatch_impl(
 
     // NCCL Gin handle
     // Each warp is a channel
-    const auto [qp_idx, sharing_mode] = comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, (kNumNotifyWarps > 0)>(
+    const auto [qp_idx, sharing_mode] = comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, kDataChannelsAboveQP0>(
         sm_idx, (warp_idx - kNumNotifyWarps) % kNumChannelsPerSM, warp_idx < kNumNotifyWarps);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
@@ -257,7 +261,7 @@ hybrid_unordered_dispatch_impl(
     const auto part_signal_id = [&](const int& part_idx) {
         return static_cast<ncclGinSignal_t>(
             comm::get_per_part_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM,
-                                         kNumParts, (kNumNotifyWarps > 0)>(
+                                         kNumParts, kDataChannelsAboveQP0>(
                 sm_idx, (warp_idx - kNumNotifyWarps) % kNumChannelsPerSM, part_idx));
     };
 
