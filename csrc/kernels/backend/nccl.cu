@@ -108,6 +108,12 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
 
         const bool scaleout_active = num_rdma_ranks > 1;
 
+        // Both hybrid kernel variants carry `EP_STATIC_ASSERT(kNumScaleoutRanks <= 32)`
+        // (`hybrid_dispatch.cuh`, `hybrid_dispatch_unordered.cuh`, `hybrid_combine_unordered.cuh`),
+        // which would otherwise only surface at JIT compilation. Reject the topology here.
+        EP_HOST_ASSERT((not allow_hybrid_mode or num_rdma_ranks <= 32) and
+                       "the hybrid kernels support at most 32 scale-out ranks (NVLink domains)");
+
         // Only the unordered hybrid kernels use the shared-context weak-signal GIN
         // configuration; direct mode and the ordered hybrid kernels keep the
         // upstream requirements untouched.
@@ -137,9 +143,10 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
             gin_config.gin_indexed_signals_cnt = 0;
         }
 
-        EP_HOST_ASSERT(gin_config.gin_indexed_signals_cnt >= (num_rdma_ranks - 1) and
-                       "GIN indexed-signal budget cannot give each peer rail team a dedicated "
-                       "signal; reduce num_allocated_qps to raise the per-context signal count");
+        // NOTES: the rail barrier used to need one indexed signal per peer, which capped
+        // scale-out at 22 NVLink domains. It now synchronizes through `putValue` iteration
+        // flags in the workspace and consumes no indexed signals, so the whole per-context
+        // budget belongs to the data path and the team size no longer bounds it.
 
         this->num_allocated_qps = gin_config.gin_context_cnt;
 

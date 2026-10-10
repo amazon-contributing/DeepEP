@@ -180,9 +180,11 @@ template <int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs, int64_t kNum
           bool kFlushStores = true,
           int kNumWarps = kNumThreads / 32>
 __forceinline__ __device__ void gin_barrier_wo_local_sync(
-    const ncclDevComm_t& nccl_dev_comm,
-    const int& scaleout_rank_idx, const int& scaleup_rank_idx, 
+    const handle::NCCLGin& gin_handle,
+    const layout::WorkspaceLayout& workspace,
+    const int& scaleout_rank_idx, const int& scaleup_rank_idx,
     const int& sm_idx, const int& thread_idx) {
+    const auto& nccl_dev_comm = gin_handle.nccl_dev_comm;
     const auto global_warp_idx = sm_idx * kNumWarps + (thread_idx / 32);
     const int& rank_idx = (std::is_same_v<team_t, ncclTeamTagWorld>) ? scaleup_rank_idx : scaleout_rank_idx;
     const int num_qps = kNumQPs == kFlushAllAllocatedQPs ? nccl_dev_comm.ginContextCount : kNumQPs;
@@ -203,9 +205,78 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
     }
 
     if (sm_idx == 0) {
+    if constexpr (std::is_same_v<team_t, ncclTeamTagRail>) {
+        // Rail barrier: arrival is a 4-byte `putValue` of the round number into a slot the
+        // sender owns on every peer, and no indexed signal is consumed.
+        //
+        // Rounds alternate between two phases so that a slot never holds more than one
+        // in-flight write, which matters because a `putValue` overwrites where the previous
+        // `SignalInc` accumulated. A rank issues its round k+2 write only after seeing every
+        // peer at round k+1, which means every peer had already read its round k value, so
+        // the round k write to that same phase slot has landed. Without the phase split,
+        // rounds k and k+2 share a slot and SRD may land them out of order, leaving a stale
+        // lower value that strands every waiter.
+        //
+        // Counters are local: `send_seq` and `recv_seq` mirror the signal shadow the world
+        // branch below uses, so the round number needs no plumbing from the host.
+        //
+        // The phase argument holds only under three call-site requirements, none of which
+        // this function can check at runtime:
+        //   1. every rank runs the same number of rail barriers per tag, so the counters on
+        //      both sides stay in lockstep;
+        //   2. two rail barriers on the same tag are separated by a rank-wide join (a grid
+        //      sync or a kernel boundary), so no thread posts round k+1 while another thread
+        //      of the same rank still waits on round k;
+        //   3. the workspace is never re-zeroed after construction (see `buffer.hpp`).
+        // Breaking any of them strands a waiter without a crash.
+        static_assert(kTag >= 0 and kTag < layout::WorkspaceLayout::kNumBarrierTags,
+                      "barrier tag exceeds the rail barrier flag table; raise kNumBarrierTags");
+
+        // Post the flag on QP 0 with CTA-scoped sharing, the context the signal protocol
+        // below uses. The caller's handle belongs to its channel and, once the SM count
+        // exceeds the QP count, is shared grid-wide, so publishing arrival through it puts
+        // the barrier behind whatever the data path is driving on that context.
+        const handle::NCCLGin barrier_gin(
+            gin_handle.nccl_dev_comm, gin_handle.nccl_window, 0, NCCL_GIN_RESOURCE_SHARING_CTA);
+
+        for (int i = thread_idx; i < kNumRanks; i += kNumThreads) {
+            if (i == rank_idx) continue;
+            const auto slot_idx = (rank_idx < i) ? rank_idx : (rank_idx - 1);
+            const auto seq_ptr = workspace.get_rail_barrier_send_seq_ptr(kTag, i);
+            const auto round = ++(*seq_ptr);
+            const auto flag_ptr = workspace.get_rail_barrier_flag_ptr(
+                kTag, static_cast<int>(round & 1), slot_idx);
+            barrier_gin.put_value<ncclTeamTagRail>(flag_ptr, round, i);
+        }
+
+        for (int i = thread_idx; i < kNumRanks - 1; i += kNumThreads) {
+            const auto seq_ptr = workspace.get_rail_barrier_recv_seq_ptr(kTag, i);
+            const auto round = ++(*seq_ptr);
+            const auto flag_ptr = workspace.get_rail_barrier_flag_ptr(
+                kTag, static_cast<int>(round & 1), i);
+
+            // Under the lockstep above the slot holds exactly `round` once the arrival
+            // lands, so an exact compare is sufficient and it turns a broken requirement
+            // into a timeout at the round where it broke, with the stale value printed.
+            timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
+                const auto flag = ptx::ld_acquire_sys(flag_ptr);
+                if (flag == round)
+                    return true;
+
+                if (is_last_check) {
+                    const auto peer_idx = (i < rank_idx) ? i : (i + 1);
+                    printf("DeepEP rail barrier timeout, tag: %d, scaleout: %d, scaleup: %d, thread: %d, "
+                           "peer: %d, flag: %u, round: %u\n",
+                           kTag, scaleout_rank_idx, scaleup_rank_idx, thread_idx, peer_idx, flag, round);
+                }
+                return false;
+            });
+        }
+    } else {
+        static_assert(std::is_same_v<team_t, ncclTeamTagWorld>, "only the world and rail teams have a GIN barrier");
+
         // Use QP 0 to do barrier
-        const auto team = (std::is_same_v<team_t, ncclTeamTagWorld>) ?
-            ncclTeamWorld(nccl_dev_comm) : ncclTeamRail(nccl_dev_comm);
+        const auto team = ncclTeamWorld(nccl_dev_comm);
         const ncclGin gin(nccl_dev_comm, 0, NCCL_GIN_RESOURCE_SHARING_CTA);
 
         // Compact signal indexing: (kNumRanks - 1) signal slots per rank. Sender rank_idx
@@ -240,6 +311,7 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
             });
         }
     }
+    }
 }
 
 template <bool kIsScaleupNVLink, int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs,
@@ -253,7 +325,7 @@ __forceinline__ __device__ void scaleup_barrier_wo_local_sync(
             gin, workspace, rank_idx, sm_idx, thread_idx);
     } else {
         gin_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, ncclTeamTagWorld, kTag, kFlushStores>(
-            gin.nccl_dev_comm, 1, rank_idx, sm_idx, thread_idx);
+            gin, workspace, 1, rank_idx, sm_idx, thread_idx);
     }
 }
 
@@ -261,10 +333,11 @@ template <int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs, int64_t kNum
           bool kFlushStores = true>
 __forceinline__ __device__ void scaleout_barrier_wo_local_sync(
     const handle::NCCLGin& gin,
+    const layout::WorkspaceLayout& workspace,
     const int& scaleout_rank_idx, const int& scaleup_rank_idx,
     const int& sm_idx, const int& thread_idx) {
     gin_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, ncclTeamTagRail, kTag, kFlushStores>(
-        gin.nccl_dev_comm, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+        gin, workspace, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
 }
 
 template <bool kIsScaleupNVLink,
@@ -308,7 +381,7 @@ __forceinline__ __device__ void gpu_barrier(const handle::NCCLGin& gin,
         } else {
             // The remaining SMs do the scaleout barrier
             scaleout_barrier_wo_local_sync<kNumScaleoutRanks, kNumSMs - 1, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores>(
-                gin, scaleout_rank_idx, scaleup_rank_idx, sm_idx - 1, thread_idx);
+                gin, workspace, scaleout_rank_idx, scaleup_rank_idx, sm_idx - 1, thread_idx);
         }
     } else if (do_scaleup) {
         // Scaleup only
@@ -317,7 +390,7 @@ __forceinline__ __device__ void gpu_barrier(const handle::NCCLGin& gin,
     } else if (do_scaleout) {
         // Scaleout only
         scaleout_barrier_wo_local_sync<kNumScaleoutRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores>(
-            gin, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+            gin, workspace, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
     }
 
     // All the SMs should wait
