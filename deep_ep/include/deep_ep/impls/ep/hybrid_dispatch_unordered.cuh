@@ -821,6 +821,8 @@ hybrid_unordered_dispatch_impl(
         int recv_scaleout_rank_idx = channel_idx % kNumScaleoutRanks;
         int stored_terminal_part = -1;
         int stored_terminal_sub = -1;
+        int anomaly_part = -1, anomaly_num_valid = 0;
+        bool anomaly_detected = false;
         uint32_t wip_mask;
         while ((wip_mask = ptx::gather(stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag == 0))) {
             // Pick next rank in round-robin
@@ -839,10 +841,12 @@ hybrid_unordered_dispatch_impl(
                 if (is_last_check) {
                     if (lane_idx < kNumScaleoutRanks) {
                         printf("DeepEP hybrid dispatch (forwarding) timeout, scale-out: %d, scale-up: %d, "
-                               "channel: %d, lane: %d, old scale-out tail: %d, scale-out tail: (%d, %d)\n",
+                               "channel: %d, lane: %d, old scale-out tail: %d, scale-out tail: (%d, %d), "
+                               "arrival anomaly: %d, part: %d, num valid: %d\n",
                                scaleout_rank_idx, scaleup_rank_idx,
                                channel_idx, lane_idx, stored_scaleout_old_tail_idx,
-                               stored_finish_flag, stored_scaleout_tail_idx);
+                               stored_finish_flag, stored_scaleout_tail_idx,
+                               static_cast<int>(anomaly_detected), anomaly_part, anomaly_num_valid);
                     }
                     return false;
                 }
@@ -861,9 +865,9 @@ hybrid_unordered_dispatch_impl(
                 bool my_finished = false;
                 #pragma unroll
                 for (int k = 0; k < kNumParts; ++ k) {
-                    const int64_t landed =
+                    const int64_t landed = ptx::exchange(
                         static_cast<int64_t>(gin.gin.readSignal(part_signal_id(k)))
-                        - rx_part_base[k];
+                        - rx_part_base[k], 0);
 
                     const int num_subs = num_sub_parts_at<kNumSubParts>(part_size(k));
                     int sub_count[kNumSubParts];
@@ -882,7 +886,12 @@ hybrid_unordered_dispatch_impl(
                             num_valid += __popc(ptx::gather(sub_valid[s]));
                         }
                     }
-                    const bool part_landed = landed >= static_cast<int64_t>(num_valid);
+                    const bool part_landed = landed == static_cast<int64_t>(num_valid);
+                    if (landed > static_cast<int64_t>(num_valid) and not anomaly_detected) {
+                        anomaly_detected = true;
+                        anomaly_part = k;
+                        anomaly_num_valid = num_valid;
+                    }
 
                     #pragma unroll
                     for (int s = 0; s < kNumSubParts; ++ s) {
