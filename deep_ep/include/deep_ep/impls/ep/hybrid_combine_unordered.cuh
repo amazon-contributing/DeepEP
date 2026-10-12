@@ -848,6 +848,10 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     if (gin_put_ops == 0)
                         __nanosleep(1000);
                 }
+
+                #pragma unroll
+                for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx)
+                    gin_ctx[forward_warp_idx].gin.flush(ncclCoopThread());
             }
             __syncwarp();
         } else {
@@ -888,6 +892,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     ptx::st_release_cta(proxy_ring_layout.get_tail(lane_idx), tail + 1);
                     ++ tail;
                 }
+
+                gin.gin.flush(ncclCoopThread());
             }
         }
     }
