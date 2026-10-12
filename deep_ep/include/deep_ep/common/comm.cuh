@@ -65,6 +65,16 @@ __device__ __forceinline__ void timeout_while(const func_t& func, const int64_t&
     timeout_while<kNumTimeoutCycles, func_t>(true, func, start_clock);
 }
 
+template <int64_t kNumTimeoutCycles, typename gin_t, typename coop_t>
+__device__ __forceinline__ void flush_with_timeout(const gin_t& gin, const coop_t& coop) {
+    if (gin.flush(coop, cuda::memory_order_acquire, ncclGin_None{},
+                  static_cast<uint64_t>(kNumTimeoutCycles)) != ncclSuccess) {
+        printf("DeepEP Gin flush timeout, sm: %d, thread: %d\n",
+               static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x));
+        ptx::trap();
+    }
+}
+
 // Channels map onto QPs with a BALANCED CONTIGUOUS (block) partition: fill a QP with
 // consecutive channels before spilling to the next (so an SM's channels stay grouped
 // on the same GIN context), and when the channels do not divide the QPs evenly,

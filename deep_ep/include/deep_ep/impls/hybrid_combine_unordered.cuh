@@ -850,7 +850,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
                 #pragma unroll
                 for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx)
-                    gin_ctx[forward_warp_idx].gin.flush(ncclCoopThread());
+                    comm::flush_with_timeout<kNumTimeoutCycles>(
+                        gin_ctx[forward_warp_idx].gin, ncclCoopThread());
             }
             __syncwarp();
         } else {
@@ -892,7 +893,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     ++ tail;
                 }
 
-                gin.gin.flush(ncclCoopThread());
+                comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopThread());
             }
         }
     }
