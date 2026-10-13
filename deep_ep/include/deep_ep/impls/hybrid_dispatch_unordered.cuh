@@ -272,6 +272,8 @@ hybrid_unordered_dispatch_impl(
     auto scaleout_recv_buffer = layout::BufferLayout<false>(
         scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleout_send_buffer.get_buffer_end_ptr());
 
+    // Flush our previous puts before the start barrier publishes anything; see `comm::kGinEntryFlush`
+    comm::flush_gin_before_barrier<kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles>(nccl_dev_comm, sm_idx, thread_idx);
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
@@ -509,6 +511,12 @@ hybrid_unordered_dispatch_impl(
             } else if (warp_idx == 1) {
                 // Exclusive prefix sum for later expanding
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
+            }
+
+            // Warp 0 issued the scale-out count puts on QP 0; see `comm::kGinExitFlush`
+            if constexpr (comm::kGinExitFlush) {
+                if (warp_idx == 0)
+                    comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp(), qp_idx);
             }
         }
     } else if (warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
@@ -782,6 +790,11 @@ hybrid_unordered_dispatch_impl(
 
         // Flush unflushed tails
         update_scaleout_tail(true);
+
+        // Wait until this channel's token puts are acknowledged before the next kernel can rewrite
+        // `scaleout_send_buffer`; see `comm::kGinExitFlush`
+        if constexpr (comm::kGinExitFlush)
+            comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp(), qp_idx);
 
     } else {
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);

@@ -39,6 +39,31 @@ static constexpr int kHybridCombineTag1 = 9;
 // Some reserved count
 static constexpr int kFlushAllAllocatedQPs = -1;
 
+// Unordered hybrid kernels never wait for the local completion of their GIN puts, yet the next
+// kernel rewrites the same buffers (dispatch and combine share one buffer with different layouts),
+// both locally and through NVLink peers, and a put that is still unacknowledged may be
+// retransmitted from the source memory at any time. A flush is required whenever a send region of
+// one kernel aliases a region that the next kernel writes, in either order (combine -> dispatch or
+// dispatch -> combine). Which pairs alias depends on the shape (top-k, local ranks,
+// `allow_multiple_reduction`), so do not rely on a particular order being safe. Two places can close
+// that window; both are set at JIT time through the environment variables of the same name:
+//   EP_GIN_ENTRY_FLUSH (default 1): at kernel entry every GIN context is flushed and the grid is
+//     synchronized *before* the start barrier publishes anything. So neither this GPU nor an NVLink
+//     peer (which passes the scale-up barrier only after our signal) nor a rail peer can write our
+//     buffers while one of our previous puts is still outstanding. The previous kernel's puts have
+//     usually been acknowledged by then, so this is nearly free.
+//   EP_GIN_EXIT_FLUSH (default 0): each warp that issued puts flushes its contexts before exiting,
+//     like the upstream ordered combine. It costs ~10% on combine, because contexts are shared by
+//     several SMs and each flush waits for all of them.
+#ifndef EP_GIN_ENTRY_FLUSH
+#define EP_GIN_ENTRY_FLUSH 1
+#endif
+#ifndef EP_GIN_EXIT_FLUSH
+#define EP_GIN_EXIT_FLUSH 0
+#endif
+static constexpr bool kGinEntryFlush = (EP_GIN_ENTRY_FLUSH) != 0;
+static constexpr bool kGinExitFlush = (EP_GIN_EXIT_FLUSH) != 0;
+
 template <int64_t kNumTimeoutCycles, typename func_t>
 __device__ __forceinline__ void timeout_while(const bool& condition, const func_t& func,
                                               int64_t start_clock = 0) {
@@ -265,6 +290,35 @@ __forceinline__ __device__ void scaleout_barrier_wo_local_sync(
     const int& sm_idx, const int& thread_idx) {
     gin_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, ncclTeamTagRail, kTag, kFlushStores>(
         gin.nccl_dev_comm, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+}
+
+// Flush `gin` and trap on timeout, like `timeout_while`: a peer that dies before acknowledging a put
+// must not turn into a silent hang. On abort NCCL returns early and the kernel proceeds.
+template <int64_t kNumTimeoutCycles, typename coop_t>
+__forceinline__ __device__ void flush_with_timeout(const ncclGin& gin, const coop_t& coop, const int& context_idx) {
+    const auto result = gin.flush(coop, cuda::memory_order_acquire, ncclGin_None{},
+                                  static_cast<uint64_t>(kNumTimeoutCycles));
+    if (result != ncclSuccess) {
+        printf("DeepEP GIN flush timeout, context: %d, result: %d\n", context_idx, static_cast<int>(result));
+        // Wait another 1 second to let all threads print information and trap
+        const auto start_clock = clock64();
+        while (clock64() - start_clock < kNumOneSecCycles) {}
+        ptx::trap();
+    }
+}
+
+// `kGinEntryFlush`: wait until all of this GPU's GIN puts are locally complete, then synchronize the
+// grid, so that the start barrier that follows (scale-up signals from SM 0 included) is published only
+// after the flush. Must be called by every thread of a cooperative launch.
+template <int kNumSMs, int kNumThreads, int kNumQPs, int64_t kNumTimeoutCycles, int kNumWarps = kNumThreads / 32>
+__forceinline__ __device__ void flush_gin_before_barrier(const ncclDevComm_t& nccl_dev_comm,
+                                                         const int& sm_idx, const int& thread_idx) {
+    if constexpr (kGinEntryFlush) {
+        const int num_qps = kNumQPs == kFlushAllAllocatedQPs ? nccl_dev_comm.ginContextCount : kNumQPs;
+        for (int i = sm_idx * kNumWarps + thread_idx / 32; i < num_qps; i += kNumSMs * kNumWarps)
+            flush_with_timeout<kNumTimeoutCycles>(ncclGin(nccl_dev_comm, i, NCCL_GIN_RESOURCE_SHARING_CTA), ncclCoopWarp(), i);
+        cooperative_groups::this_grid().sync();
+    }
 }
 
 template <bool kIsScaleupNVLink,

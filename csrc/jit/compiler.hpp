@@ -70,6 +70,9 @@ public:
         // TODO: make it more general, e.g. `EP_JIT_EXTRA_FLAGS`
         if (int num_topk_idx_bits = get_env("EP_NUM_TOPK_IDX_BITS", 0); num_topk_idx_bits != 0)
             flags += fmt::format(" -DEP_NUM_TOPK_IDX_BITS={}", num_topk_idx_bits);
+        // Where the unordered hybrid kernels flush their GIN puts (`comm::kGinEntryFlush` / `kGinExitFlush`)
+        flags += fmt::format(" -DEP_GIN_ENTRY_FLUSH={}", get_env<int>("EP_GIN_ENTRY_FLUSH", 1) != 0 ? 1 : 0);
+        flags += fmt::format(" -DEP_GIN_EXIT_FLUSH={}", get_env<int>("EP_GIN_EXIT_FLUSH", 0) != 0 ? 1 : 0);
     }
 
     virtual ~Compiler() = default;

@@ -126,6 +126,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
     // Global parallel barriers for scale-out subteam and scale-up subteam
     // NOTES: this barrier needs a grid sync, as there are channel scale-up tail cleaning before
+    // Flush our previous puts before the start barrier publishes anything; see `comm::kGinEntryFlush`
+    comm::flush_gin_before_barrier<kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles>(nccl_dev_comm, sm_idx, thread_idx);
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridCombineTag0, false, true, true>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
@@ -847,6 +849,14 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     if (gin_put_ops == 0)
                         __nanosleep(1000);
                 }
+
+                // All rings drained: wait until every channel's puts are acknowledged before the
+                // next kernel can rewrite `scaleout_send_buffer`; see `comm::kGinExitFlush`
+                if constexpr (comm::kGinExitFlush) {
+                    #pragma unroll
+                    for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx)
+                        comm::flush_with_timeout<kNumTimeoutCycles>(gin_ctx[forward_warp_idx].gin, ncclCoopThread(), forward_warp_idx);
+                }
             }
             __syncwarp();
         } else {
@@ -887,6 +897,10 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     ptx::st_release_cta(proxy_ring_layout.get_tail(lane_idx), tail + 1);
                     ++ tail;
                 }
+
+                // This lane's ring is drained; see `comm::kGinExitFlush`
+                if constexpr (comm::kGinExitFlush)
+                    comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopThread(), qp_idx);
             }
         }
     }
