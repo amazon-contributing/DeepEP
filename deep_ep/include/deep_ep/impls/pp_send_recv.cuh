@@ -36,7 +36,7 @@ __device__ __forceinline__ void check_signal(
     comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
         const auto signal = static_cast<int64_t>(
             gin.gin.readSignal(signal_idx, 64, cuda::memory_order_acquire));
-        if (signal >= target)
+        if (comm::signal_delta(signal, target) >= 0)
             return true;
 
         if (is_last_check)
