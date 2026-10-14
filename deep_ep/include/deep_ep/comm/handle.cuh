@@ -8,6 +8,20 @@
 
 namespace deep_ep::comm {
 
+// A signal can be backed by a counter this many bits wide, so it wraps while the shadow it is
+// compared against keeps counting. Conservative: it must not exceed the narrowest counter any
+// backend uses, and must stay above the largest delta a wait can have outstanding.
+static constexpr int kNumSignalBits = 31;
+
+// Difference between a signal and a shadow. An absolute `signal - base` is wrong from the first
+// wrap on, so take it modulo the counter's range and fold the result into the signed half of
+// that range instead.
+__device__ __forceinline__ int64_t signal_delta(const uint64_t& signal, const uint64_t& base) {
+    constexpr int64_t kRange = int64_t{1} << kNumSignalBits;
+    const int64_t diff = static_cast<int64_t>((signal - base) & (kRange - 1));
+    return diff < kRange / 2 ? diff : diff - kRange;
+}
+
 struct NCCLGin {
 #define IS_TEAM_WORLD(code) if constexpr (std::is_same_v<team_t, ncclTeamTagWorld>) { code }
 #define IS_TEAM_LSA(code) if constexpr (std::is_same_v<team_t, ncclTeamTagLsa>) { code }
@@ -179,14 +193,14 @@ struct NCCLGin {
     __device__ __forceinline__
     void wait_signal(const int& signal_idx, const int& rank_idx) const {
         IS_TEAM_WORLD_RAIL({
-            // NOTES: signals are rolling counters, whose width follows the shadow counter type
+            // NOTES: signals are rolling counters, compared within `kNumSignalBits`
             const auto shadow_ptr = gin.getSignalShadowPtr(signal_idx);
             const auto target = ++(*shadow_ptr);
             const auto result = gin.waitSignal(
-                ncclCoopThread(), signal_idx, target, sizeof(*shadow_ptr) * 8,
+                ncclCoopThread(), signal_idx, target, kNumSignalBits,
                 cuda::memory_order_acquire, kNumTimeoutCycles);
             if (result != ncclSuccess) {
-                const auto signal = gin.readSignal(signal_idx, sizeof(*shadow_ptr) * 8, cuda::memory_order_acquire);
+                const auto signal = gin.readSignal(signal_idx, kNumSignalBits, cuda::memory_order_acquire);
                 // This waiting thread owns the shadow entry; reload only for diagnostics
                 // to avoid keeping target live into the timeout path.
                 const uint64_t timeout_target = *static_cast<const volatile uint64_t*>(shadow_ptr);
