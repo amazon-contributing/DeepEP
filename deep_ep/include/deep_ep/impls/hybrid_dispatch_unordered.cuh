@@ -872,8 +872,7 @@ hybrid_unordered_dispatch_impl(
                 #pragma unroll
                 for (int k = 0; k < kNumParts; ++ k) {
                     const int64_t landed = ptx::exchange(
-                        static_cast<int64_t>(gin.gin.readSignal(part_signal_id(k)))
-                        - rx_part_base[k], 0);
+                        comm::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]), 0);
 
                     const int num_subs = num_sub_parts_at<kNumSubParts>(part_size(k));
                     int sub_count[kNumSubParts];
@@ -1095,7 +1094,7 @@ hybrid_unordered_dispatch_impl(
             if (lane_idx == k and expected_k > 0) {
                 comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
                     const int64_t landed =
-                        static_cast<int64_t>(gin.gin.readSignal(part_signal_id(k))) - rx_part_base[k];
+                        comm::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]);
                     if (landed >= static_cast<int64_t>(expected_k))
                         return true;
                     if (is_last_check)
