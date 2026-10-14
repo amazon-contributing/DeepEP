@@ -756,7 +756,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             const auto target = (*shadow_ptr += static_cast<uint64_t>(num_expected_arrivals));
             comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
                 const auto signal = gin.gin.readSignal(signal_id, 64, cuda::memory_order_acquire);
-                if (signal >= target)
+                if (comm::signal_delta(signal, target) >= 0)
                     return true;
 
                 if (is_last_check) {

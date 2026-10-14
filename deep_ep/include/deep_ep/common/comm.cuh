@@ -39,6 +39,18 @@ static constexpr int kHybridCombineTag1 = 9;
 // Some reserved count
 static constexpr int kFlushAllAllocatedQPs = -1;
 
+// A signal can be backed by a counter this many bits wide, so it wraps while the shadow it is
+// compared against keeps counting. Conservative: it must not exceed the narrowest counter any
+// backend uses, and must stay above the largest delta a wait can have outstanding.
+static constexpr int kNumSignalBits = 31;
+
+// Difference between a signal and a shadow. An absolute `signal - base` is wrong from the first
+// wrap on, so sign-extend the low `kNumSignalBits` bits of it instead.
+__device__ __forceinline__ int64_t signal_delta(const uint64_t& signal, const uint64_t& base) {
+    constexpr int kShift = 32 - kNumSignalBits;
+    return static_cast<int>(static_cast<uint32_t>(signal - base) << kShift) >> kShift;
+}
+
 template <int64_t kNumTimeoutCycles, typename func_t>
 __device__ __forceinline__ void timeout_while(const bool& condition, const func_t& func,
                                               int64_t start_clock = 0) {
@@ -229,7 +241,7 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
             // TODO(NCCL): Using the official NCCL wait signal API, after they added timeout check.
             timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
                 const auto signal = gin.readSignal(signal_idx, 64, cuda::memory_order_acquire);
-                if (signal >= target)
+                if (signal_delta(signal, target) >= 0)
                     return true;
 
                 if (is_last_check) {
