@@ -122,6 +122,13 @@ __forceinline__ __device__ void tma_store_fence() {
     asm volatile("fence.proxy.async.shared::cta;");
 }
 
+// Order this thread's generic-proxy accesses before its async-proxy (TMA) accesses to global
+// memory. Needed when a TMA load reads data whose arrival was established by a generic acquire:
+// the two proxies are otherwise unordered, so the load may return stale data.
+__forceinline__ __device__ void fence_proxy_async_global() {
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+}
+
 template <int kNumRemainingWaits = 0>
 __forceinline__ __device__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group %0;" ::"n"(kNumRemainingWaits) : "memory");

@@ -947,6 +947,11 @@ hybrid_unordered_dispatch_impl(
                 __syncwarp();
             };
 
+            // The slots about to be read were established as landed by generic-proxy acquires;
+            // the TMA loads below are async-proxy accesses and are not ordered against those
+            // acquires without this fence.
+            ptx::fence_proxy_async_global();
+
             if constexpr (kDoubleBufferForward) {
                 ptx::tma_store_wait();
                 __syncwarp();
