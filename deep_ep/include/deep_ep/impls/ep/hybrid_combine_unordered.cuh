@@ -432,8 +432,22 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 .get_token_buffer(batch_start_slot[dst])
                 .get_base_ptr();
 
-            // Wait for a free ring slot.
-            while (my_head - ptx::ld_acquire_cta(my_tail_ptr) >= static_cast<unsigned>(kProxyRingDepth)) {}
+            // Wait for a free ring slot. Timed: this is the producer half of the hand-off with
+            // the proxy warp, so if the proxy stops draining this ring the warp parks here with
+            // nothing to report — the SM stays at 100% and no timeout or Xid fires.
+            comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                const auto ring_tail = ptx::ld_acquire_cta(my_tail_ptr);
+                if (my_head - ring_tail < static_cast<unsigned>(kProxyRingDepth))
+                    return true;
+
+                if (is_last_check) {
+                    printf("DeepEP combine (proxy ring full) timeout, scale-out: %d, scale-up: %d, "
+                           "channel: %d, forward warp: %d, dst: %d, head: %u, tail: %u, depth: %d\n",
+                           scaleout_rank_idx, scaleup_rank_idx, channel_idx, forward_warp_idx,
+                           dst, my_head, ring_tail, kProxyRingDepth);
+                }
+                return false;
+            });
 
             const unsigned slot = my_head % static_cast<unsigned>(kProxyRingDepth);
             my_ring[slot].send_ptr = send_ptr;
