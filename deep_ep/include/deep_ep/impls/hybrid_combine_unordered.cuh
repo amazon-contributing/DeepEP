@@ -18,7 +18,61 @@
 #include <deep_ep/impls/combine_utils.cuh>
 #include <deep_ep/impls/proxy_ring.cuh>
 
+#ifndef EP_COMBINE_BATCH_SIZE
+#define EP_COMBINE_BATCH_SIZE 6
+#endif
+
 namespace deep_ep::elastic {
+
+// Iterate the whole forward metadata list and count how many tokens (forward slots) this channel
+// will send to each scale-out destination. Warp-wide: each lane scans a stride, then the per-lane
+// tallies are summed.
+template <bool kAllowMultipleReduction, bool kUseExpandedLayout,
+          int kNumScaleoutRanks, int kNumScaleupRanks, int kNumMaxTokensPerRank,
+          int kNumMaxTokensPerChannel, int kNumTopk, int kNumForwardMetadataDims>
+__device__ __forceinline__ void count_forward_slots_per_dst(
+        const int* token_metadata_at_forward, const int& lane_idx,
+        int (&out)[kNumScaleoutRanks]) {
+    for (int base = 0; ; base += 32) {
+        const int idx = base + lane_idx;
+        const bool in_range = idx < kNumScaleoutRanks * kNumMaxTokensPerChannel;
+        const int g = in_range
+            ? __ldg(token_metadata_at_forward + idx * kNumForwardMetadataDims) : -1;
+        // Lanes at or beyond the `-1` sentinel are past the end of the list.
+        const unsigned alive = ptx::gather(g >= 0);
+        const int first_dead = __ffs(static_cast<int>(~alive));
+        const int live_lanes = first_dead == 0 ? 32 : first_dead - 1;
+        if (lane_idx < live_lanes) {
+            const int dst = (g / kNumMaxTokensPerRank) / kNumScaleupRanks;
+            int slots = 1;
+            if constexpr (not kAllowMultipleReduction) {
+                int n = 0;
+                #pragma unroll
+                for (int k = 0; k < kNumTopk; ++ k) {
+                    const int v = __ldg(token_metadata_at_forward +
+                                        idx * kNumForwardMetadataDims + 2 + k);
+                    if (v < 0)
+                        continue;
+                    bool dup = false;
+                    if constexpr (not kUseExpandedLayout) {
+                        #pragma unroll
+                        for (int pk = 0; pk < k; ++ pk)
+                            dup |= (__ldg(token_metadata_at_forward +
+                                          idx * kNumForwardMetadataDims + 2 + pk) == v);
+                    }
+                    n += not dup;
+                }
+                slots = n;
+            }
+            out[dst] += slots;
+        }
+        if (live_lanes < 32)
+            break;
+    }
+    #pragma unroll
+    for (int d = 0; d < kNumScaleoutRanks; ++ d)
+        out[d] = ptx::reduce_add(out[d]);
+}
 
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumSMs,
@@ -30,7 +84,7 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumQPs, int64_t kNumTimeoutCycles,
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
           int kNumScaleupUpdateInterval = 3,
-          int kBatchSize = 12,
+          int kBatchSize = EP_COMBINE_BATCH_SIZE,
           int kProxyRingDepth = kProxyRingDepthDefault,
           int kNumChannelsPerSM = kNumForwardWarps,
           int kNumChannels = kNumChannelsPerSM * kNumSMs,
@@ -388,13 +442,6 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         const auto forward_warp_idx = warp_idx - kNumScaleupWarps;
         const auto channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
 
-        // Indexed-signal id owned by this channel within its GIN context. Uses the
-        // companion helper to `get_qp_mode` (called at kernel entry) so the id is
-        // unique among all channels sharing this warp's QP, regardless of which of
-        // `get_qp_mode`'s branches picked the mapping.
-        const auto signal_id = static_cast<ncclGinSignal_t>(
-            comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
-
         // Adjust registers
         if constexpr (kAdjustRegisters)
             ptx::warpgroup_reg_alloc<kNumRegistersForForwardWarps>();
@@ -410,6 +457,21 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         token_metadata_at_forward += channel_idx * ((kNumScaleoutRanks * kNumMaxTokensPerChannel + 1) * kNumForwardMetadataDims);
 
         // Per Channel/ScaleOutRank batch metadata
+        // Slots this channel owes each scale-out peer, counted DOWN as they are recorded;
+        // reaching 0 means that destination is finished.
+        int num_slots_remaining_per_dst[kNumScaleoutRanks] = {};
+        count_forward_slots_per_dst<kAllowMultipleReduction, kUseExpandedLayout, kNumScaleoutRanks,
+                                    kNumScaleupRanks, kNumMaxTokensPerRank, kNumMaxTokensPerChannel,
+                                    kNumTopk, kNumForwardMetadataDims>(
+            token_metadata_at_forward, lane_idx, num_slots_remaining_per_dst);
+        __syncwarp();
+        // Slots this channel still owes remote peers in total; at 0 the ring can be retired.
+        int num_remote_slots_remaining = 0;
+        #pragma unroll
+        for (int d = 0; d < kNumScaleoutRanks; ++ d)
+            if (d != scaleout_rank_idx)
+                num_remote_slots_remaining += num_slots_remaining_per_dst[d];
+
         int batch_count[kNumScaleoutRanks] = {};
         int batch_start_slot[kNumScaleoutRanks];
 
@@ -451,8 +513,17 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             if (batch_count[dst] == 0)
                 batch_start_slot[dst] = slot;
             batch_count[dst] += 1;
-            if (batch_count[dst] == kBatchSize)
+
+            // A destination whose tokens are all handled will get no more, so forward its batch
+            // now instead of waiting for it to fill.
+            const bool dst_exhausted = (-- num_slots_remaining_per_dst[dst] == 0);
+            if (batch_count[dst] == kBatchSize or dst_exhausted)
                 issue_batched_rdma(dst);
+
+            // All tokens for every destination are used: tell the proxy immediately so it can
+            // stop waiting for more descriptors on this ring.
+            if (-- num_remote_slots_remaining == 0)
+                ptx::st_release_cta(proxy_ring_layout.get_done(forward_warp_idx), 1);
         };
 
         int last_src_scaleout_rank_idx = -1;
@@ -675,39 +746,32 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         }
         __syncwarp();
 
-        // Update, wait and clean
+    } else {
+        // Count the arrivals this SM must wait for.
+        //
+        // The rule is "distinct valid non-local packed entries per token", scanned out of
+        // `token_map_at_dispatch` -- my own outbound routing decisions during dispatch, which are
+        // exactly what the peers send back. Summed over all `kNumChannelsPerSM` channels of this SM.
+        // Full warp, before the electing thread takes over.
+        //
+        // Concrete example -- token T=0 on channel C, topK=4, my scaleout_rank_idx=3, routing
+        // (k=0 -> scaleout 1, k=1 -> scaleout 0, k=2 -> scaleout 0, k=3 -> scaleout 3):
+        //   Reduce mode (map = [pack(1,0,C), pack(0,0,C), pack(0,0,C), pack(3,0,C)]):
+        //     k=0 remote, first sight          -> count
+        //     k=1 remote, first sight          -> count
+        //     k=2 remote, duplicate of k=1     -> skip
+        //     k=3 == self, local bypass        -> skip
+        //   Expected puts for T=0 = 2; peer 0 sends one reduced partial covering k=1+k=2.
+        int sm_num_expected_arrivals = 0;
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Invalid ranks");
-
-        // Derive the expected inbound put count for this channel by counting my own
-        // outbound routing decisions during dispatch. Count "distinct valid non-local packed
-        // entries per T" — same rule works for reduce and expand modes because of how
-        // dispatch fills the map.
-        //
-        // Concrete example — token T=0 on channel C, topK=4, my scaleout_rank_idx=3,
-        // routing (k=0 → scaleout 1, k=1 → scaleout 0, k=2 → scaleout 0, k=3 → scaleout 3):
-        //
-        //   Reduce mode (map = [ pack(1,0,C), pack(0,0,C), pack(0,0,C), pack(3,0,C) ]):
-        //     k=0: valid, rank=1 (remote), first sight of pack(1,0,C)         → count
-        //     k=1: valid, rank=0 (remote), first sight of pack(0,0,C)         → count
-        //     k=2: valid, rank=0 (remote), pack(0,0,C) already seen (dup)     → skip
-        //     k=3: valid, rank=3 (== self, local-bypass, no put fires)        → skip
-        //   Expected puts for T=0 = 2. Peer R=0 sends one reduced partial covering k=1+k=2.
-        //
-        //   Expand mode (map = [ pack(1,0,C), pack(0,0,C), pack(0,1,C), pack(3,0,C) ]):
-        //     k=0: valid, rank=1 (remote), unique packed value  → count
-        //     k=1: valid, rank=0 (remote), unique packed value  → count
-        //     k=2: valid, rank=0 (remote), unique packed value  → count
-        //     k=3: valid, rank=3 (self)                          → skip
-        //   Expected puts for T=0 = 3. Peer R=0 sends two separate partials (k=1, k=2)
-        //   at distinct slots because each valid k has its own packed slot in expand mode.
-        int local_expected_count_per_rank[kNumScaleoutRanks] = {};
-        {
-            #pragma unroll
+        #pragma unroll
+        for (int c = 0; c < kNumChannelsPerSM; ++ c) {
+            const int scan_channel_idx = sm_idx * kNumChannelsPerSM + c;
+            int local_expected_count_per_rank[kNumScaleoutRanks] = {};
             for (int t_in_channel = lane_idx; t_in_channel < kNumMaxTokensPerChannel; t_in_channel += 32) {
-                const int token_idx = channel_idx + t_in_channel * kNumChannels;
+                const int token_idx = scan_channel_idx + t_in_channel * kNumChannels;
                 if (token_idx >= num_combined_tokens)
                     continue;
-                // Load this token's map entries once, then dedup+count within the topK block.
                 int packed_entries[kNumTopk];
                 #pragma unroll
                 for (int k = 0; k < kNumTopk; ++ k)
@@ -719,11 +783,9 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                         continue;
                     int rank, slot, channel;
                     unpack_combine_recv_addr(p, rank, slot, channel);
-                    // Sanity: token T dispatched by us with `T % kNumChannels == channel_idx`
-                    // must have its map entry's channel field equal to channel_idx.
-                    EP_DEVICE_ASSERT(channel == channel_idx);
+                    EP_DEVICE_ASSERT(channel == scan_channel_idx);
                     if (rank == scaleout_rank_idx)
-                        continue;   // local-bypass, no RDMA put
+                        continue;   // local bypass, no RDMA put comes back for it
                     bool is_duplicate = false;
                     #pragma unroll
                     for (int prior_k = 0; prior_k < k; ++ prior_k)
@@ -732,163 +794,140 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                         local_expected_count_per_rank[rank] += 1;
                 }
             }
-        }
-
-        // Each lane in the Forward warp (= channel) accumulated the expected tokens per scale-out
-        // rank in its own slice of the map. All-reduce across lanes so every lane sees
-        // the full per-rank total. Then divide by the batch size, that's the aggregation
-        // granularity we expect on the wire.
-        int num_expected_arrivals = 0;
-        #pragma unroll
-        for (int r = 0; r < kNumScaleoutRanks; ++ r) {
-            const int rank_total = ptx::reduce_add(local_expected_count_per_rank[r]);
-            num_expected_arrivals += math::ceil_div(rank_total, kBatchSize);
+            // Reduce across lanes BEFORE the ceil_div: batching happens per (peer, channel), not
+            // per lane, so dividing a lane's partial count would round up far too often.
+            #pragma unroll
+            for (int r = 0; r < kNumScaleoutRanks; ++ r)
+                sm_num_expected_arrivals +=
+                    math::ceil_div(ptx::reduce_add(local_expected_count_per_rank[r]), kBatchSize);
         }
         __syncwarp();
-        // Wait for the per-channel indexed signal to accumulate `num_expected_arrivals`
-        // increments from the remote senders. Bump the shadow by the expected delta to
-        // get the target count, then poll the actual signal until it catches up. only
-        // one lane polls. We poll with a timeout (instead of the blocking
-        // `waitSignalMeetShadow`) so a stuck peer surfaces a diagnostic rather than
-        // hanging.
+
         if (ptx::elect_one_sync()) {
-            const auto shadow_ptr = gin.gin.getSignalShadowPtr(signal_id);
-            const auto target = (*shadow_ptr += static_cast<uint64_t>(num_expected_arrivals));
+            int num_forward_warps_done_cnt = 0;
+            unsigned tail[kNumForwardWarps] = {};
+            bool ring_done[kNumForwardWarps] = {};
+            // A single thread in a single warp posts for the whole SM, using one GIN context
+            // and one indexed signal.
+            const auto rail_signal_id = static_cast<ncclGinSignal_t>(
+                comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, 0));
+
+            // Either THREAD or GPU. One lane in one warp posts, so CTA is unnecessary and
+            // THREAD is more efficient.
+            const auto [rail_qp, mapped_mode] =
+                comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, 0);
+            const auto rail_mode = mapped_mode == NCCL_GIN_RESOURCE_SHARING_GPU
+                                 ? NCCL_GIN_RESOURCE_SHARING_GPU
+                                 : NCCL_GIN_RESOURCE_SHARING_THREAD;
+            handle::NCCLGin rail_ctx(nccl_dev_comm, nccl_window, rail_qp, rail_mode);
+
+            while (num_forward_warps_done_cnt < kNumForwardWarps) {
+                // Two passes, so the round's last put -- the one that rings the doorbell -- is
+                // known before any put is issued.
+
+                // Pass 1: count what each ring holds.
+                int pending_count[kNumForwardWarps] = {};
+                int total_pending = 0;
+                // Once any warp is done, stop holding rounds back and drain every sweep.
+                bool any_ring_finished = false;
+
+                #pragma unroll
+                for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx) {
+                    if (ring_done[forward_warp_idx]) {
+                        any_ring_finished = true;
+                        continue;
+                    }
+
+                    const unsigned head = ptx::ld_acquire_cta(proxy_ring_layout.get_head(forward_warp_idx));
+
+                    if (tail[forward_warp_idx] == head) {
+                        if (ptx::ld_acquire_cta(proxy_ring_layout.get_done(forward_warp_idx)) == 1 and
+                            tail[forward_warp_idx] == ptx::ld_acquire_cta(proxy_ring_layout.get_head(forward_warp_idx))) {
+                            ring_done[forward_warp_idx] = true;
+                            ++ num_forward_warps_done_cnt;
+                            any_ring_finished = true;
+                        }
+                        continue;
+                    }
+
+                    // Unsigned subtraction, correct across wrap; bounded by kProxyRingDepth.
+                    pending_count[forward_warp_idx] = static_cast<int>(head - tail[forward_warp_idx]);
+                    total_pending += pending_count[forward_warp_idx];
+
+                    // A non-empty ring can still have a finished producer.
+                    if (ptx::ld_acquire_cta(proxy_ring_layout.get_done(forward_warp_idx)) != 0)
+                        any_ring_finished = true;
+                }
+
+                // Wait for one descriptor per forward warp, then send them all under one
+                // doorbell. A floor, not a cap. Exempt in the tail, which would wait forever.
+                const bool drain_now = total_pending > 0 and
+                                       (total_pending >= kNumForwardWarps or any_ring_finished);
+
+                const auto issue_put = [&](const ProxyPutDesc& d, const int& ring_idx,
+                                           const bool& ring_doorbell) {
+                    rail_ctx.put<ncclTeamTagRail>(
+                        d.recv_ptr, d.send_ptr,
+                        d.num_bytes,
+                        d.dst,
+                        ring_doorbell ? 0 : ncclGinOptFlagsAggregateRequests,
+                        ncclGin_SignalAdd{rail_signal_id, static_cast<uint64_t>(1)}
+                    );
+                    ++ tail[ring_idx];
+                    ptx::st_release_cta(proxy_ring_layout.get_tail(ring_idx), tail[ring_idx]);
+                };
+
+                if (not drain_now) {
+                    __nanosleep(1000);
+                    continue;
+                }
+
+                // Pass 2: drain the whole snapshot. Anything queued mid-round waits for the next.
+                //
+                // Issuing lags one descriptor behind the scan so each put knows the next put's
+                // destination. A deferred doorbell only covers one destination -- GDAKI gives each
+                // peer its own QP, hence its own doorbell -- so a destination change must ring.
+                ProxyPutDesc pend{};
+                int pend_ring = -1;
+                #pragma unroll
+                for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx) {
+                    // Fixed base: `issue_put` advances `tail[forward_warp_idx]` for the descriptor
+                    // held back, which trails this scan by one.
+                    const unsigned read_base = tail[forward_warp_idx];
+                    for (int k = 0; k < pending_count[forward_warp_idx]; ++ k) {
+                        const ProxyPutDesc desc = proxy_ring_layout.get_ring(forward_warp_idx)[
+                            (read_base + static_cast<unsigned>(k)) % static_cast<unsigned>(kProxyRingDepth)];
+                        if (pend_ring >= 0)
+                            issue_put(pend, pend_ring, pend.dst != desc.dst);
+                        pend = desc;
+                        pend_ring = forward_warp_idx;
+                    }
+                }
+                // `drain_now` guarantees a descriptor was scanned. The round's last put always
+                // rings, so no WQE is left un-rung.
+                issue_put(pend, pend_ring, true);
+            }
+
+            // Wait for all arrivals from the peer rail SMs.
+            const auto shadow_ptr = rail_ctx.gin.getSignalShadowPtr(rail_signal_id);
+            const auto target = (*shadow_ptr += static_cast<uint64_t>(sm_num_expected_arrivals));
             comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-                const auto signal = gin.gin.readSignal(signal_id, 64, cuda::memory_order_acquire);
+                const auto signal =
+                    rail_ctx.gin.readSignal(rail_signal_id, 64, cuda::memory_order_acquire);
                 if (signal >= target)
                     return true;
-
                 if (is_last_check) {
-                    printf("DeepEP combine (scale-out wait all) timeout, scale-out: %d/%d, scale-up: %d/%d, "
-                           "channel: %d, signal: %lu, target: %lu\n",
+                    // SM-wide, not per channel: one signal now covers every channel of this SM, so
+                    // the per-channel attribution the old message printed no longer exists.
+                    printf("DeepEP combine (scale-out wait all) timeout, scale-out: %d/%d, "
+                           "scale-up: %d/%d, sm: %d, signal: %lu, target: %lu, expected: %d\n",
                            scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
-                           channel_idx, signal, target);
+                           sm_idx, signal, target, sm_num_expected_arrivals);
                 }
                 return false;
             });
         }
         __syncwarp();
-    } else {
-        // Proxy warp loop shape: arch-selected at JIT compile time.
-        //   SM100+ (B200) -> sequential single-lane sweeper.
-        //   otherwise (H200) -> parallel multi-lane (each lane owns its ring).
-        //
-        // B200 forward warps run faster so batches arrive at the proxy unevenly,
-        // driving high lane divergence in the parallel design. H200 forward warps
-        // are slower, so batches arrive more evenly and most lanes have work
-        // together -> low divergence.
-        //
-        // Divergence cost per put step: sum(Ln for n in 0..kNumForwardWarps-1)
-        // (all lanes' PC time) + lane-context-switch overhead. On B200 that beats
-        // the serial sweep; on H200 the parallel throughput gain dominates.
-        #if __CUDA_ARCH__ >= 1000
-        constexpr bool kSingleLaneSweeper = true;
-        #else
-        constexpr bool kSingleLaneSweeper = false;
-        #endif
-
-        if constexpr (kSingleLaneSweeper) {
-            // Sequential design: one lane sweeps all rings, issues puts serially.
-            // Owns per-ring GIN contexts (built inline so each put routes to its
-            // channel's QP). Best when per-put cost is high enough that warp-lockstep
-            // parallelism doesn't pay off (B200 SM100).
-            if (ptx::elect_one_sync()) {
-                int num_forward_warps_done_cnt = 0;
-                unsigned tail[kNumForwardWarps] = {};
-                bool ring_done[kNumForwardWarps] = {};
-                ncclGinSignal_t ring_signal_id[kNumForwardWarps];
-
-                alignas(handle::NCCLGin) unsigned char gin_ctx_storage[kNumForwardWarps * sizeof(handle::NCCLGin)];
-                auto* const gin_ctx = reinterpret_cast<handle::NCCLGin*>(gin_ctx_storage);
-                #pragma unroll
-                for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx) {
-                    ring_signal_id[forward_warp_idx] = static_cast<ncclGinSignal_t>(
-                        comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
-                    const auto [qp, mode] =
-                        comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx);
-                    new (&gin_ctx[forward_warp_idx]) handle::NCCLGin(nccl_dev_comm, nccl_window, qp, mode);
-                }
-
-                while (num_forward_warps_done_cnt < kNumForwardWarps) {
-                    int gin_put_ops = 0;
-
-                    #pragma unroll
-                    for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx) {
-                        if (ring_done[forward_warp_idx])
-                            continue;
-
-                        const unsigned head = ptx::ld_acquire_cta(proxy_ring_layout.get_head(forward_warp_idx));
-
-                        if (tail[forward_warp_idx] == head) {
-                            if (ptx::ld_acquire_cta(proxy_ring_layout.get_done(forward_warp_idx)) == 1 and
-                                tail[forward_warp_idx] == ptx::ld_acquire_cta(proxy_ring_layout.get_head(forward_warp_idx))) {
-                                ring_done[forward_warp_idx] = true;
-                                ++ num_forward_warps_done_cnt;
-                            }
-                            continue;
-                        }
-
-                        const auto& desc = proxy_ring_layout.get_ring(forward_warp_idx)[
-                            tail[forward_warp_idx] % static_cast<unsigned>(kProxyRingDepth)];
-                        gin_ctx[forward_warp_idx].put<ncclTeamTagRail>(
-                            desc.recv_ptr, desc.send_ptr,
-                            desc.num_bytes,
-                            desc.dst,
-                            0, /*flags=0*/
-                            ncclGin_SignalAdd{ring_signal_id[forward_warp_idx], static_cast<uint64_t>(1)}
-                        );
-
-                        ++ tail[forward_warp_idx];
-                        ptx::st_release_cta(proxy_ring_layout.get_tail(forward_warp_idx), tail[forward_warp_idx]);
-                        ++ gin_put_ops;
-                    }
-
-                    if (gin_put_ops == 0)
-                        __nanosleep(1000);
-                }
-            }
-            __syncwarp();
-        } else {
-            // Parallel design: each lane represents one forward warp within this SM
-            // and drains its own ring. Warp-lockstep parallelism across up to
-            // kNumForwardWarps lanes — best when per-put cost is small (H200 SM90).
-            if (lane_idx < kNumForwardWarps) {
-                const auto channel_idx = sm_idx * kNumChannelsPerSM + lane_idx;
-                const auto signal_id = static_cast<ncclGinSignal_t>(
-                    comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, lane_idx));
-
-                ProxyPutDesc* const ring = proxy_ring_layout.get_ring(lane_idx);
-                unsigned tail = 0;
-
-                while (true) {
-                    const unsigned head = ptx::ld_acquire_cta(proxy_ring_layout.get_head(lane_idx));
-                    if (tail == head) {
-                        if (ptx::ld_acquire_cta(proxy_ring_layout.get_done(lane_idx)) != 0) {
-                            // Re-check head to avoid missing a descriptor published just
-                            // before `done` became visible.
-                            if (tail == ptx::ld_acquire_cta(proxy_ring_layout.get_head(lane_idx)))
-                                break;
-                        } else if (tail != 0 and (tail % static_cast<unsigned>(kNumForwardWarps)) == 0) {
-                            __nanosleep(1000); // release context for data warps
-                        }
-                        continue;
-                    }
-
-                    const auto& desc = ring[tail % static_cast<unsigned>(kProxyRingDepth)];
-                    gin.put<ncclTeamTagRail>(
-                        desc.recv_ptr, desc.send_ptr,
-                        desc.num_bytes,
-                        desc.dst,
-                        0, /*flags=0*/
-                        ncclGin_SignalAdd{signal_id, static_cast<uint64_t>(1)}
-                    );
-
-                    ptx::st_release_cta(proxy_ring_layout.get_tail(lane_idx), tail + 1);
-                    ++ tail;
-                }
-            }
-        }
     }
 
     // No barrier at epilogue

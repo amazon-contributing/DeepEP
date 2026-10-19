@@ -70,6 +70,11 @@ public:
         // TODO: make it more general, e.g. `EP_JIT_EXTRA_FLAGS`
         if (int num_topk_idx_bits = get_env("EP_NUM_TOPK_IDX_BITS", 0); num_topk_idx_bits != 0)
             flags += fmt::format(" -DEP_NUM_TOPK_IDX_BITS={}", num_topk_idx_bits);
+
+        // Different configurations have different compute power, so combine's
+        // batching is adjusted accordingly.
+        flags += fmt::format(" -DEP_COMBINE_BATCH_SIZE={}",
+                             device_runtime->get_arch_major() >= 10 ? 6 : 12);
     }
 
     virtual ~Compiler() = default;
