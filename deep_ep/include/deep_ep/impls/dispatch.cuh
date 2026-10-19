@@ -143,7 +143,7 @@ dispatch_impl(
                                static_cast<int>(status >> 32), static_cast<int>(status & 0xffffffff), kNumSMs);
                     }
                     return false;
-                });
+                }, nccl_dev_comm.abortFlag);
             }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
@@ -197,7 +197,7 @@ dispatch_impl(
                     if (is_last_check)
                         printf("DeepEP notify timeout, rank: %d, thread: %d, count: %d\n", rank_idx, i, decoded);
                     return false;
-                }, start_clock);
+                }, start_clock, nccl_dev_comm.abortFlag);
             }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 

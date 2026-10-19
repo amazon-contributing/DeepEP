@@ -39,17 +39,33 @@ static constexpr int kHybridCombineTag1 = 9;
 // Some reserved count
 static constexpr int kFlushAllAllocatedQPs = -1;
 
+// Spins between abort-flag polls. The flag only changes when the communicator is being torn
+// down, and these waits are hot, so polling every iteration would not pay for itself.
+static constexpr uint32_t kNumAbortCheckSteps = 10000;
+
 template <int64_t kNumTimeoutCycles, typename func_t>
 __device__ __forceinline__ void timeout_while(const bool& condition, const func_t& func,
+                                              uint32_t* abort_flag = nullptr,
                                               int64_t start_clock = 0) {
     // User may share a start clock for multiple waits
     if (start_clock == 0)
         start_clock = clock64();
 
+    uint32_t steps = 0;
     while (condition) {
         const bool timeout = clock64() - start_clock >= kNumTimeoutCycles;
         if (func(timeout))
             break;
+
+        // The communicator is aborting, so give up waiting for a peer that will never arrive.
+        // Leave without trapping: a trap corrupts the CUDA context, which is exactly what an
+        // abort is trying to keep intact for an in-process restart. Whatever this kernel
+        // produces from here is discarded along with the communicator.
+        if (abort_flag != nullptr and ++steps >= kNumAbortCheckSteps) {
+            steps = 0;
+            if (*reinterpret_cast<volatile uint32_t*>(abort_flag) != 0)
+                break;
+        }
 
         if (timeout) {
             // Wait another 1 second to let all threads print information and trap
@@ -61,8 +77,9 @@ __device__ __forceinline__ void timeout_while(const bool& condition, const func_
 }
 
 template <int64_t kNumTimeoutCycles, typename func_t>
-__device__ __forceinline__ void timeout_while(const func_t& func, const int64_t& start_clock = 0) {
-    timeout_while<kNumTimeoutCycles, func_t>(true, func, start_clock);
+__device__ __forceinline__ void timeout_while(const func_t& func, uint32_t* abort_flag = nullptr,
+                                              const int64_t& start_clock = 0) {
+    timeout_while<kNumTimeoutCycles, func_t>(true, func, abort_flag, start_clock);
 }
 
 template <int64_t kNumTimeoutCycles, typename gin_t, typename coop_t>
@@ -182,7 +199,7 @@ __forceinline__ __device__ void nvlink_barrier_wo_local_sync(
                    *workspace.get_nvl_barrier_counter_ptr());
         }
         return false;
-    });
+    }, gin.nccl_dev_comm.abortFlag);
 }
 
 template <int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs, int64_t kNumTimeoutCycles,
@@ -247,7 +264,7 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
                            "signal: %lu, target: %lu\n", kTag, scaleout_rank_idx, scaleup_rank_idx, thread_idx, signal, target);
                 }
                 return false;
-            });
+            }, nccl_dev_comm.abortFlag);
         }
     }
 }
