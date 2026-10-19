@@ -42,7 +42,7 @@ __device__ __forceinline__ void check_signal(
         if (is_last_check)
             timeout_print();
         return false;
-    });
+    }, gin.nccl_dev_comm.abortFlag);
 }
 
 template <int kNumSMs,

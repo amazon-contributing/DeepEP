@@ -352,7 +352,7 @@ hybrid_unordered_dispatch_impl(
                                static_cast<int>(status >> 32), static_cast<int>(status & 0xffffffff), kNumSMs);
                     }
                     return false;
-                });
+                }, nccl_dev_comm.abortFlag);
             }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
@@ -395,7 +395,7 @@ hybrid_unordered_dispatch_impl(
                                    decoded);
                         }
                         return false;
-                    });
+                    }, nccl_dev_comm.abortFlag);
 
                     // Add and clean for next usages
                     count += decoded, *ptr = 0;
@@ -481,7 +481,7 @@ hybrid_unordered_dispatch_impl(
                            static_cast<int>(status >> 32), static_cast<int>(status & 0xffffffff), kNumScaleupRanks);
                 }
                 return false;
-            });
+            }, nccl_dev_comm.abortFlag);
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
             // Do prefix sum by the warps of the first SM
@@ -921,7 +921,7 @@ hybrid_unordered_dispatch_impl(
                 }
                 __syncwarp();
                 return false;
-            });
+            }, nccl_dev_comm.abortFlag);
 
             // Process one chunk from the current rank
             const auto start_slot_idx = ptx::exchange(stored_scaleout_old_tail_idx, recv_scaleout_rank_idx);
@@ -1099,7 +1099,7 @@ hybrid_unordered_dispatch_impl(
                                "channel: %d, part: %d, landed: %lld, expected: %d\n",
                                channel_idx, k, (long long)landed, expected_k);
                     return false;
-                });
+                }, nccl_dev_comm.abortFlag);
                 gin.gin.increaseSignalShadow(part_signal_id(k), static_cast<uint64_t>(expected_k));
             }
         }

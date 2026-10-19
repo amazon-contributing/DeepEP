@@ -446,7 +446,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                            dst, my_head, ring_tail, kProxyRingDepth);
                 }
                 return false;
-            });
+            }, nccl_dev_comm.abortFlag);
 
             const unsigned slot = my_head % static_cast<unsigned>(kProxyRingDepth);
             my_ring[slot].send_ptr = send_ptr;
@@ -538,7 +538,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     }
                 }
                 return false;
-            });
+            }, nccl_dev_comm.abortFlag);
 
             // Increase received count
             #pragma unroll
@@ -780,7 +780,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                            channel_idx, signal, target);
                 }
                 return false;
-            });
+            }, nccl_dev_comm.abortFlag);
         }
         __syncwarp();
     } else {
