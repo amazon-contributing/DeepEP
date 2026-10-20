@@ -510,6 +510,8 @@ hybrid_unordered_dispatch_impl(
                 // Exclusive prefix sum for later expanding
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
             }
+
+            comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
         }
     } else if (warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
         const int scaleout_warp_idx = warp_idx - kNumNotifyWarps;
@@ -782,6 +784,8 @@ hybrid_unordered_dispatch_impl(
 
         // Flush unflushed tails
         update_scaleout_tail(true);
+
+        comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
 
     } else {
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
