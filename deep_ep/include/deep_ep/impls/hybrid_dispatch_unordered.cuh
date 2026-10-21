@@ -856,20 +856,6 @@ hybrid_unordered_dispatch_impl(
                 if (ptx::exchange(arrived_or_finished, recv_scaleout_rank_idx))
                     return true;
 
-                // Timeout
-                if (is_last_check) {
-                    if (lane_idx < kNumScaleoutRanks) {
-                        printf("DeepEP hybrid dispatch (forwarding) timeout, scale-out: %d, scale-up: %d, "
-                               "channel: %d, lane: %d, old scale-out tail: %d, scale-out tail: (%d, %d), "
-                               "arrival anomaly: %d, part: %d, num valid: %d\n",
-                               scaleout_rank_idx, scaleup_rank_idx,
-                               channel_idx, lane_idx, stored_scaleout_old_tail_idx,
-                               stored_finish_flag, stored_scaleout_tail_idx,
-                               static_cast<int>(anomaly_detected), anomaly_part, anomaly_num_valid);
-                    }
-                    return false;
-                }
-
                 const bool src_valid = lane_idx < kNumScaleoutRanks;
                 const bool is_local_src = (lane_idx == scaleout_rank_idx);
                 int intended_finish = 0, intended_tail = 0;
@@ -882,6 +868,7 @@ hybrid_unordered_dispatch_impl(
                 int incremental_tail = stored_scaleout_tail_idx;
                 bool prefix_alive = is_remote_src;
                 bool my_finished = false;
+                int missing_part = -1, missing_num_valid = 0, missing_landed = 0;
                 #pragma unroll
                 for (int k = 0; k < kNumParts; ++ k) {
                     const int64_t landed = ptx::exchange(
@@ -910,6 +897,11 @@ hybrid_unordered_dispatch_impl(
                         anomaly_part = k;
                         anomaly_num_valid = num_valid;
                     }
+                    if (static_cast<int64_t>(num_valid) > landed and missing_part < 0) {
+                        missing_part = k;
+                        missing_num_valid = num_valid;
+                        missing_landed = static_cast<int>(landed);
+                    }
 
                     #pragma unroll
                     for (int s = 0; s < kNumSubParts; ++ s) {
@@ -936,6 +928,18 @@ hybrid_unordered_dispatch_impl(
                         stored_finish_flag = 1;
                 }
                 __syncwarp();
+
+                // Timeout
+                if (is_last_check and lane_idx < kNumScaleoutRanks)
+                    printf("DeepEP hybrid dispatch (forwarding) timeout, scale-out: %d, scale-up: %d, "
+                           "channel: %d, lane: %d, old scale-out tail: %d, scale-out tail: (%d, %d), "
+                           "arrival anomaly: %d, part: %d, num valid: %d, "
+                           "completion missing: %d, missing part: %d, valid headers: %d, completions: %d\n",
+                           scaleout_rank_idx, scaleup_rank_idx,
+                           channel_idx, lane_idx, stored_scaleout_old_tail_idx,
+                           stored_finish_flag, stored_scaleout_tail_idx,
+                           static_cast<int>(anomaly_detected), anomaly_part, anomaly_num_valid,
+                           static_cast<int>(missing_part >= 0), missing_part, missing_num_valid, missing_landed);
                 return false;
             });
 
