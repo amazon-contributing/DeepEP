@@ -1095,9 +1095,9 @@ hybrid_unordered_dispatch_impl(
                     if (landed >= static_cast<int64_t>(expected_k))
                         return true;
                     if (is_last_check)
-                        printf("DeepEP hybrid dispatch (epilogue shadow drain) timeout, "
+                        printf("DeepEP hybrid dispatch (epilogue shadow drain) timeout, scale-out: %d, scale-up: %d, "
                                "channel: %d, part: %d, landed: %lld, expected: %d\n",
-                               channel_idx, k, (long long)landed, expected_k);
+                               scaleout_rank_idx, scaleup_rank_idx, channel_idx, k, (long long)landed, expected_k);
                     return false;
                 });
                 gin.gin.increaseSignalShadow(part_signal_id(k), static_cast<uint64_t>(expected_k));

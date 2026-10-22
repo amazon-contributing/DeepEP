@@ -524,10 +524,12 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                         ptx::ld_acquire_sys(workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, k)) : -1;
                 }
 
-                // Timeout
+                // Timeout (one line per scale-up rank, the other lanes have no state)
                 if (is_last_check) {
                     #pragma unroll
                     for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
+                        if (j * 32 + lane_idx >= kNumScaleupRanks)
+                            continue;
                         printf("DeepEP combine (scale-up wait) timeout, scale-out: %d/%d, scale-up: %d/%d, "
                                "channel: %d, lane: %d, recv: %d, tail: %d (wait=%d)\n",
                                scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,

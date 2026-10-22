@@ -88,6 +88,9 @@ struct WorkspaceLayout {
         // AGRS signals
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
 
+        // Timed grid sync counter
+        num_bytes += sizeof(uint32_t);
+
         return num_bytes;
     }
 
@@ -185,6 +188,11 @@ struct WorkspaceLayout {
         const auto base_ptr = math::advance_ptr<int>(
             get_agrs_recv_signal_ptr(0, 0), kNumMaxInflightAGRS * kNumMaxRanks * sizeof(int));
         return base_ptr + rank_idx;
+    }
+
+    __forceinline__ __device__ __host__ uint32_t* get_grid_sync_counter_ptr() const {
+        return reinterpret_cast<uint32_t*>(math::advance_ptr<int>(
+            get_agrs_session_signal_ptr(0), kNumMaxRanks * sizeof(int)));
     }
 };
 
