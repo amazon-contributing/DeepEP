@@ -350,6 +350,8 @@ hybrid_unordered_dispatch_impl(
                                "thread: %d, status: %d | %d, expected: %d\n",
                                scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks, thread_idx,
                                static_cast<int>(status >> 32), static_cast<int>(status & 0xffffffff), kNumSMs);
+                        if (thread_idx == 0)
+                            comm::report_gin_queue("hybrid notify", gin.gin._makeCtx(), scaleout_rank_idx, scaleup_rank_idx);
                     }
                     return false;
                 });
@@ -393,6 +395,8 @@ hybrid_unordered_dispatch_impl(
                                    is_expert_reduction ? "expert" : "rank",
                                    scaleout_rank_idx, scaleup_rank_idx, thread_idx, j,
                                    decoded);
+                            if (thread_idx == 0)
+                                comm::report_gin_queue("hybrid notify", gin.gin._makeCtx(), scaleout_rank_idx, scaleup_rank_idx);
                         }
                         return false;
                     });
@@ -479,6 +483,8 @@ hybrid_unordered_dispatch_impl(
                            "thread: %d, status: %d | %d, expected: %d\n",
                            scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks, thread_idx,
                            static_cast<int>(status >> 32), static_cast<int>(status & 0xffffffff), kNumScaleupRanks);
+                    if (thread_idx == 0)
+                        comm::report_gin_queue("hybrid notify", gin.gin._makeCtx(), scaleout_rank_idx, scaleup_rank_idx);
                 }
                 return false;
             });
@@ -850,6 +856,8 @@ hybrid_unordered_dispatch_impl(
                                stored_finish_flag, stored_scaleout_tail_idx,
                                static_cast<int>(anomaly_detected), anomaly_part, anomaly_num_valid);
                     }
+                    if (lane_idx == 0)
+                        comm::report_gin_queue("hybrid dispatch (forwarding)", gin.gin._makeCtx(), scaleout_rank_idx, scaleup_rank_idx);
                     return false;
                 }
 
@@ -1094,10 +1102,12 @@ hybrid_unordered_dispatch_impl(
                         static_cast<int64_t>(gin.gin.readSignal(part_signal_id(k))) - rx_part_base[k];
                     if (landed >= static_cast<int64_t>(expected_k))
                         return true;
-                    if (is_last_check)
+                    if (is_last_check) {
                         printf("DeepEP hybrid dispatch (epilogue shadow drain) timeout, "
                                "channel: %d, part: %d, landed: %lld, expected: %d\n",
                                channel_idx, k, (long long)landed, expected_k);
+                        comm::report_gin_queue("hybrid dispatch (epilogue drain)", gin.gin._makeCtx(), scaleout_rank_idx, scaleup_rank_idx);
+                    }
                     return false;
                 });
                 gin.gin.increaseSignalShadow(part_signal_id(k), static_cast<uint64_t>(expected_k));

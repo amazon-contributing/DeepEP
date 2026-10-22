@@ -444,6 +444,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                            "channel: %d, forward warp: %d, dst: %d, head: %u, tail: %u, depth: %d\n",
                            scaleout_rank_idx, scaleup_rank_idx, channel_idx, forward_warp_idx,
                            dst, my_head, ring_tail, kProxyRingDepth);
+                    comm::report_gin_queue("combine (proxy ring full)", gin.gin._makeCtx(), scaleout_rank_idx, scaleup_rank_idx);
                 }
                 return false;
             });
@@ -536,6 +537,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                                stored_cached_scaleup_tail[j],
                                stored_is_scaleup_rank_needed[j]);
                     }
+                    if (lane_idx == 0)
+                        comm::report_gin_queue("combine (scale-up wait)", gin.gin._makeCtx(), scaleout_rank_idx, scaleup_rank_idx);
                 }
                 return false;
             });
@@ -778,6 +781,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                            "channel: %d, signal: %lu, target: %lu\n",
                            scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
                            channel_idx, signal, target);
+                    comm::report_gin_queue("combine (scale-out wait all)", gin.gin._makeCtx(), scaleout_rank_idx, scaleup_rank_idx);
                 }
                 return false;
             });
@@ -865,7 +869,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 #pragma unroll
                 for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx)
                     comm::flush_with_timeout<kNumTimeoutCycles>(
-                        gin_ctx[forward_warp_idx].gin, ncclCoopThread());
+                        gin_ctx[forward_warp_idx].gin, ncclCoopThread(), scaleout_rank_idx, scaleup_rank_idx);
             }
             __syncwarp();
         } else {
@@ -907,7 +911,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     ++ tail;
                 }
 
-                comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopThread());
+                comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopThread(), scaleout_rank_idx, scaleup_rank_idx);
             }
         }
     }
