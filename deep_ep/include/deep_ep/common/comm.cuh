@@ -39,6 +39,20 @@ static constexpr int kHybridCombineTag1 = 9;
 // Some reserved count
 static constexpr int kFlushAllAllocatedQPs = -1;
 
+// A signal can be backed by a counter this many bits wide, so it wraps while the shadow it is
+// compared against keeps counting. Conservative: it must not exceed the narrowest counter any
+// backend uses, and must stay above the largest delta a wait can have outstanding.
+static constexpr int kNumSignalBits = 31;
+
+// Difference between a signal and a shadow. An absolute `signal - base` is wrong from the first
+// wrap on, so take it modulo the counter's range and fold the result into the signed half of
+// that range instead.
+__device__ __forceinline__ int64_t signal_delta(const uint64_t& signal, const uint64_t& base) {
+    constexpr int64_t kRange = int64_t{1} << kNumSignalBits;
+    const int64_t diff = static_cast<int64_t>((signal - base) & (kRange - 1));
+    return diff < kRange / 2 ? diff : diff - kRange;
+}
+
 template <int64_t kNumTimeoutCycles, typename func_t>
 __device__ __forceinline__ void timeout_while(const bool& condition, const func_t& func,
                                               int64_t start_clock = 0) {
@@ -236,18 +250,21 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
             const auto shadow_ptr = gin.getSignalShadowPtr(signal_idx);
             const auto target = ++(*shadow_ptr);
 
-            // TODO(NCCL): Using the official NCCL wait signal API, after they added timeout check.
-            timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-                const auto signal = gin.readSignal(signal_idx, 64, cuda::memory_order_acquire);
-                if (signal >= target)
-                    return true;
-
-                if (is_last_check) {
-                    printf("DeepEP Gin barrier timeout, tag: %d, scaleout: %d, scaleup: %d, thread: %d, "
-                           "signal: %lu, target: %lu\n", kTag, scaleout_rank_idx, scaleup_rank_idx, thread_idx, signal, target);
-                }
-                return false;
-            });
+            // Wait through NCCL's own API: it compares within `kNumSignalBits` so the signal
+            // wrapping is handled and reports a timeout.
+            // The timeout overload needs NCCL >= 2.31.2
+            if (gin.waitSignal(ncclCoopThread(), signal_idx, target, kNumSignalBits,
+                               cuda::memory_order_acquire,
+                               static_cast<uint64_t>(kNumTimeoutCycles)) != ncclSuccess) {
+                printf("DeepEP Gin barrier timeout, tag: %d, scaleout: %d, scaleup: %d, thread: %d, "
+                       "slot: %d, target: %lu\n", kTag, scaleout_rank_idx, scaleup_rank_idx, thread_idx,
+                       static_cast<int>(signal_idx), target);
+                // Wait another 1 second to let all threads print information and
+                // trap similar to timeout_while
+                const auto stop = clock64() + kNumOneSecCycles;
+                while (clock64() < stop) {}
+                ptx::trap();
+            }
         }
     }
 }
