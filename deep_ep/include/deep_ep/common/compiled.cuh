@@ -102,4 +102,7 @@ constexpr int kNumDispatchSendBuffers = 1;
 constexpr int kNumDispatchFwdBuffers = 2;
 constexpr int kNumDispatchBuffersPerChannel = kNumDispatchSendBuffers + kNumDispatchFwdBuffers;
 
+// One word per warp at the end of the dynamic shared memory, for the GIN post nanny (`comm::guarded_post`)
+constexpr int kNumNannySmemBytes = 32 * sizeof(unsigned);
+
 } // namespace deep_ep

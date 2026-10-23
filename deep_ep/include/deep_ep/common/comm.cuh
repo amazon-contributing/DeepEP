@@ -65,6 +65,36 @@ __device__ __forceinline__ void timeout_while(const func_t& func, const int64_t&
     timeout_while<kNumTimeoutCycles, func_t>(true, func, start_clock);
 }
 
+template <int64_t kNumTimeoutCycles, typename post_t>
+__device__ __forceinline__ void guarded_post(const bool& do_post, const post_t& post, const char* where,
+                                             const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
+    extern __shared__ __align__(16) int8_t nanny_smem[];
+    uint32_t num_smem_bytes;
+    asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(num_smem_bytes));
+    auto* returned = reinterpret_cast<unsigned*>(nanny_smem + (num_smem_bytes - kNumNannySmemBytes)) + threadIdx.x / 32;
+    const unsigned post_mask = __ballot_sync(0xffffffffu, do_post);
+    const int lane_idx = static_cast<int>(threadIdx.x) % 32, nanny_lane_idx = __ffs(~post_mask) - 1;
+    if (lane_idx == nanny_lane_idx)
+        *returned = 0;
+    __syncwarp();
+    if (do_post) {
+        post();
+        atomicOr_block(returned, 1u << lane_idx);
+    } else if (lane_idx == nanny_lane_idx and post_mask != 0) {
+        timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+            const auto returned_mask = *reinterpret_cast<volatile unsigned*>(returned);
+            if (returned_mask == post_mask)
+                return true;
+            if (is_last_check)
+                printf("DeepEP GIN post stuck (%s), scale-out: %d, scale-up: %d, sm: %d, warp: %d, stuck lanes: 0x%08x\n",
+                       where, scaleout_rank_idx, scaleup_rank_idx, static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x / 32),
+                       post_mask & ~returned_mask);
+            return false;
+        });
+    }
+    __syncwarp();
+}
+
 template <int64_t kNumTimeoutCycles, typename gin_t, typename coop_t>
 __device__ __forceinline__ void flush_with_timeout(const gin_t& gin, const coop_t& coop) {
     if (gin.flush(coop, cuda::memory_order_acquire, ncclGin_None{},

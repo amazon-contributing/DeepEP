@@ -902,7 +902,7 @@ public:
             const auto combine_token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
             EP_HOST_ASSERT(num_sms <= kNumMaxSMs);
             num_channels_per_sm = std::min<int>(
-                (num_smem_bytes - get_num_notify_smem_bytes(nccl_context->num_ranks, num_experts)) / dispatch_token_layout.get_num_bytes<true>(),
+                (num_smem_bytes - kNumNannySmemBytes - get_num_notify_smem_bytes(nccl_context->num_ranks, num_experts)) / dispatch_token_layout.get_num_bytes<true>(),
                 32 - kNumNotifyWarps);
             num_channels_per_sm = std::min<int>(
                 num_smem_bytes / combine_token_layout.get_num_bytes<true>(),
@@ -926,7 +926,7 @@ public:
             EP_HOST_ASSERT(static_cast<int64_t>(dispatch_buffers_per_channel) * num_channels_per_sm *
                                    dispatch_token_layout.get_num_bytes<true>() +
                                get_num_notify_smem_bytes(nccl_context->num_ranks, num_experts) <=
-                           num_smem_bytes and
+                           num_smem_bytes - kNumNannySmemBytes and
                            "dispatch TMA pool exceeds the shared-memory budget");
             if (not prefer_overlap_with_compute)
                 num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
