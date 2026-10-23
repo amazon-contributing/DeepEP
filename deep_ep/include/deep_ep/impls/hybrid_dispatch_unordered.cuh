@@ -825,6 +825,8 @@ hybrid_unordered_dispatch_impl(
         int stored_terminal_sub = -1;
         int anomaly_part = -1, anomaly_num_valid = 0;
         bool anomaly_detected = false;
+        EP_STATIC_ASSERT(kNumScaleoutRanks * kNumSubParts < 4096, "Header count does not fit its field");
+        int missing_completion = -1;
         uint32_t wip_mask;
         while ((wip_mask = ptx::gather(stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag == 0))) {
             // Pick next rank in round-robin
@@ -844,11 +846,14 @@ hybrid_unordered_dispatch_impl(
                     if (lane_idx < kNumScaleoutRanks) {
                         printf("DeepEP hybrid dispatch (forwarding) timeout, scale-out: %d, scale-up: %d, "
                                "channel: %d, lane: %d, old scale-out tail: %d, scale-out tail: (%d, %d), "
-                               "arrival anomaly: %d, part: %d, num valid: %d\n",
+                               "arrival anomaly: %d, part: %d, num valid: %d, "
+                               "completion missing: %d, part: %d, valid headers: %d, completions: %d\n",
                                scaleout_rank_idx, scaleup_rank_idx,
                                channel_idx, lane_idx, stored_scaleout_old_tail_idx,
                                stored_finish_flag, stored_scaleout_tail_idx,
-                               static_cast<int>(anomaly_detected), anomaly_part, anomaly_num_valid);
+                               static_cast<int>(anomaly_detected), anomaly_part, anomaly_num_valid,
+                               static_cast<int>(missing_completion >= 0), missing_completion >> 24,
+                               (missing_completion >> 12) & 0xfff, missing_completion & 0xfff);
                     }
                     return false;
                 }
@@ -865,6 +870,7 @@ hybrid_unordered_dispatch_impl(
                 int incremental_tail = stored_scaleout_tail_idx;
                 bool prefix_alive = is_remote_src;
                 bool my_finished = false;
+                missing_completion = -1;
                 #pragma unroll
                 for (int k = 0; k < kNumParts; ++ k) {
                     const int64_t landed = ptx::exchange(
@@ -894,6 +900,8 @@ hybrid_unordered_dispatch_impl(
                         anomaly_part = k;
                         anomaly_num_valid = num_valid;
                     }
+                    if (static_cast<int64_t>(num_valid) > landed and missing_completion < 0)
+                        missing_completion = (k << 24) | (num_valid << 12) | static_cast<int>(landed);
 
                     #pragma unroll
                     for (int s = 0; s < kNumSubParts; ++ s) {
