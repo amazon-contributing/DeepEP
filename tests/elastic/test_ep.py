@@ -534,6 +534,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     def construct_elastic_buffer():
         return deep_ep.ElasticBuffer(group,
                                      num_max_tokens_per_rank=args.num_tokens, hidden=args.hidden,
+                                     num_topk=args.num_topk,
                                      deterministic=args.deterministic,
                                      allow_hybrid_mode=args.allow_hybrid_mode,
                                      allow_multiple_reduction=args.allow_multiple_reduction,
