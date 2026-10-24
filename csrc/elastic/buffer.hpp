@@ -42,7 +42,9 @@ class ElasticBuffer {
     bool destroyed = false;
 
     // Workspace
-    // NOTES: for all workspace, we must keep them as zeros
+    // NOTES: for all workspace, we must keep them as zeros, with one carve-out: the rail
+    // barrier flags and round counters at the end of `WorkspaceLayout` are monotonic and
+    // are zeroed only here at construction. Never re-zero the workspace after that.
     void *workspace;
     void *host_workspace, *mapped_host_workspace;
     std::shared_ptr<layout::WorkspaceLayout> workspace_layout_wo_expert;
