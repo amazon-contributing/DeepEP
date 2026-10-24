@@ -83,12 +83,13 @@ constexpr bool kEnableSM90Features = false;
 constexpr int kDebugChecks = EP_DEBUG_CHECKS;
 constexpr int kDebugCheckGinQueue = 1 << 0;
 constexpr bool kReportGinQueue = (kDebugChecks & kDebugCheckGinQueue) != 0;
+constexpr int kDebugCheckTokens = 1 << 1;   // Scan each token in the dispatch and combine epilogues
 
 struct DebugCheckName {
     const char* name;
     int bit;
 };
-constexpr DebugCheckName kDebugCheckNames[] = {{"queue", kDebugCheckGinQueue}};
+constexpr DebugCheckName kDebugCheckNames[] = {{"queue", kDebugCheckGinQueue}, {"token_integrity", kDebugCheckTokens}};
 
 template <int kNumBits> struct int_with_bits;
 template <> struct int_with_bits<8>  { using type = int8_t;  };
