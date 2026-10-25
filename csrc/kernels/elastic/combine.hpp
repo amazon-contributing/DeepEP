@@ -40,6 +40,7 @@ public:
         int num_topk;
         int num_qps;
         int64_t num_timeout_cycles;
+        int debug_checks;
 
         // Parameters
         nv_bfloat16* x;
@@ -77,7 +78,7 @@ public:
                                     args.num_qps, args.num_timeout_cycles);
         } else {
             header_name = args.use_ordered_kernel ? "hybrid_combine" : "hybrid_combine_unordered";
-            func_name = fmt::format("{}<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("{}<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}{}>",
                                     args.use_ordered_kernel ? "hybrid_combine_impl" : "hybrid_unordered_combine_impl",
                                     args.use_expanded_layout, args.allow_multiple_reduction,
                                     args.launch_args.grid_dim.first,
@@ -88,7 +89,8 @@ public:
                                     args.num_experts,
                                     args.num_topk,
                                     args.num_qps,
-                                    args.num_timeout_cycles);
+                                    args.num_timeout_cycles,
+                                    args.use_ordered_kernel ? std::string() : fmt::format(", {}", args.debug_checks));
         }
         return fmt::format(R"(
 #include <deep_ep/impls/{}.cuh>
@@ -216,6 +218,7 @@ static void* launch_combine(void* x,
         .num_experts = num_experts,
         .num_topk = num_topk,
         .num_qps = num_qps, .num_timeout_cycles = num_timeout_cycles,
+        .debug_checks = get_debug_check_mask(),
         .x = static_cast<nv_bfloat16*>(x),
         .topk_weights = static_cast<float*>(topk_weights),
         .src_metadata = src_metadata,
