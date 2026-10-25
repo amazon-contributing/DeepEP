@@ -13,6 +13,7 @@
 
 #include <deep_ep/common/comm.cuh>
 #include <deep_ep/common/compiled.cuh>
+#include <deep_ep/common/diag_gin.cuh>
 #include <deep_ep/common/exception.cuh>
 #include <deep_ep/common/gin_resource_alloc.cuh>
 #include <deep_ep/common/layout.cuh>
@@ -271,6 +272,10 @@ hybrid_unordered_dispatch_impl(
         scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleup_buffer.get_buffer_end_ptr());
     auto scaleout_recv_buffer = layout::BufferLayout<false>(
         scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleout_send_buffer.get_buffer_end_ptr());
+
+    // Debug check: the GIN signals must be level with their shadows before the entry barrier
+    diag::check_gin_signals<kNumScaleoutRanks>(nccl_dev_comm, "dispatch", dispatch_iteration, rank_idx,
+                                               sm_idx * kNumThreads + thread_idx, kNumSMs * kNumThreads);
 
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
