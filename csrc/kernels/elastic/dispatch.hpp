@@ -53,6 +53,7 @@ public:
         int num_experts, num_topk, expert_alignment;
         int num_qps;
         int64_t num_timeout_cycles;
+        int debug_checks;
 
         // Parameters
         void* x; sf_pack_t* sf; topk_idx_t* topk_idx; float* topk_weights;
@@ -104,7 +105,7 @@ public:
                 args.num_qps, args.num_timeout_cycles);
         } else {
             header_name = "hybrid_dispatch_unordered";
-            func_name = fmt::format("hybrid_unordered_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("hybrid_unordered_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
                 args.allow_multiple_reduction,
@@ -117,7 +118,8 @@ public:
                 args.num_max_tokens_per_rank,
                 args.num_experts, args.num_topk, args.expert_alignment,
                 args.num_qps, args.num_timeout_cycles,
-                args.gin_indexed_signals_cnt);
+                args.gin_indexed_signals_cnt,
+                args.debug_checks);
         }
 
         return fmt::format(R"(
@@ -286,6 +288,7 @@ static void launch_dispatch(void* x, void* sf,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .num_experts = num_experts, .num_topk = num_topk, .expert_alignment = expert_alignment,
         .num_qps = num_qps, .num_timeout_cycles = num_timeout_cycles,
+        .debug_checks = get_debug_check_mask(),
         .x = x, .sf = static_cast<sf_pack_t*>(sf), .topk_idx = topk_idx, .topk_weights = topk_weights,
         .copied_topk_idx = copied_topk_idx,
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats,

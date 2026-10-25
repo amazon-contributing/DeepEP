@@ -13,6 +13,7 @@
 
 #include <deep_ep/common/comm.cuh>
 #include <deep_ep/common/compiled.cuh>
+#include <deep_ep/common/diag_gin.cuh>
 #include <deep_ep/common/exception.cuh>
 #include <deep_ep/common/gin_resource_alloc.cuh>
 #include <deep_ep/common/layout.cuh>
@@ -144,6 +145,7 @@ template <bool kDoCPUSync,
           int kNumExperts, int kNumTopk, int kExpertAlignment,
           int kNumQPs, int64_t kNumTimeoutCycles,
           int kNumGinSignals,
+          int kDebugChecks,
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
           int kNumChannelsPerSM = kNumScaleoutWarps,
           int kNumChannels = kNumScaleoutWarps * kNumSMs,
@@ -284,6 +286,10 @@ hybrid_unordered_dispatch_impl(
         }
         ptx::fence_release_sys();
     }
+
+    // Debug check: the GIN signals must be in the expected state before the entry barrier
+    if constexpr (kDebugChecks & kDebugCheckTokenSync)
+        diag::check_gin_signals(nccl_dev_comm, sm_idx * kNumThreads + thread_idx, kNumSMs * kNumThreads);
 
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
