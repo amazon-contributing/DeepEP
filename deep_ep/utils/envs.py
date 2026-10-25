@@ -249,7 +249,7 @@ def get_nvlink_gbs(factor: float = 0.9) -> float:
 
 
 @functools.lru_cache()
-def check_fast_rdma_atomic_support(nic_name: str = 'mlx5_0') -> bool:
+def check_fast_rdma_atomic_support(nic_name: str = _DEFAULT_NIC_NAME) -> bool:
     """
     Check whether the NIC supports fast RDMA atomic operations (MT4131 or newer).
 
