@@ -227,6 +227,7 @@ public:
     void engram_write(const torch::Tensor& storage, const std::optional<torch::Tensor>& sf) {
         // Ensure previous fetch are finished
         barrier(false, true);
+        nccl_context->create_dev_comm(nccl_context->gin_dev_comm, true);
 
         const auto compute_stream = at::cuda::getCurrentCUDAStream();
 
@@ -307,7 +308,7 @@ public:
 
         // Launch the fetch kernel
         launch_engram_fetch(
-            nccl_context->dev_comm, nccl_context->window,
+            nccl_context->gin_dev_comm, nccl_context->window,
             math::advance_ptr(buffer, num_gpu_buffer_bytes),
             fetched.data_ptr(),
             indices.data_ptr<int>(),
@@ -329,7 +330,7 @@ public:
             // Wait for all RDMA gets to complete
             launch_engram_fetch_wait(
                 static_cast<ncclGinRequest_t*>(last_gin_requests.data_ptr()),
-                nccl_context->dev_comm,
+                nccl_context->gin_dev_comm,
                 nccl_context->window,
                 nccl_context->num_scaleout_ranks,
                 nccl_context->num_scaleup_ranks,
@@ -345,6 +346,10 @@ public:
         // Flush previous operations
         barrier(false, true);
 
+        // The PP kernels send on the world team, which the hybrid GIN requirements do not provide
+        EP_HOST_ASSERT(not allow_hybrid_mode and "PP does not support `allow_hybrid_mode`");
+        nccl_context->create_dev_comm(nccl_context->gin_dev_comm, true);
+
         EP_HOST_ASSERT(num_max_tensor_bytes > 0 and num_max_inflight_tensors > 0);
         EP_HOST_ASSERT(num_max_tensor_bytes * num_max_inflight_tensors * 2 * 2 <= num_buffer_bytes);
         this->prev_rank_idx = (nccl_context->rank_idx + nccl_context->num_ranks - 1) % nccl_context->num_ranks;
@@ -359,7 +364,7 @@ public:
         EP_HOST_ASSERT(dst_rank_idx == prev_rank_idx or dst_rank_idx == next_rank_idx);
 
         launch_pp_send(
-            nccl_context->dev_comm, nccl_context->window,
+            nccl_context->gin_dev_comm, nccl_context->window,
             x.data_ptr(), x.nbytes(),
             buffer, workspace,
             nccl_context->rank_idx, dst_rank_idx, nccl_context->num_ranks,
@@ -378,7 +383,7 @@ public:
         EP_HOST_ASSERT(src_rank_idx == prev_rank_idx or src_rank_idx == next_rank_idx);
 
         launch_pp_recv(
-            nccl_context->dev_comm, nccl_context->window,
+            nccl_context->gin_dev_comm, nccl_context->window,
             x.data_ptr(), x.nbytes(),
             buffer, workspace,
             nccl_context->rank_idx, src_rank_idx, nccl_context->num_ranks,
