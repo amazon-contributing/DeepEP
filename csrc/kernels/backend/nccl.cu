@@ -93,20 +93,23 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
 
     const bool gin_disabled = get_env("EP_DISABLE_GIN", 0) != 0;
 
+    // GIN is only needed when a peer is unreachable over NVLink. The rail team size is
+    // that test in both modes: hybrid sets `num_scaleup_ranks = num_nvl_ranks`, and
+    // direct has `num_ranks = num_nvl_ranks * num_rail_ranks`.
+    const int num_rail_ranks = ncclTeamRail(comm).nRanks;
+    EP_HOST_ASSERT(num_ranks == ncclTeamLsa(comm).nRanks * num_rail_ranks);
+
     // Initialize NCCL device communicator
     ncclCommProperties props = NCCL_COMM_PROPERTIES_INITIALIZER;
     NCCL_CHECK(ncclCommQueryProperties(comm, &props));
     ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-    if (num_ranks > 1 and not gin_disabled) {
+    if (num_rail_ranks > 1 and not gin_disabled) {
         EP_HOST_ASSERT(
             (allow_hybrid_mode ? props.railedGinType : props.ginType) != NCCL_GIN_TYPE_NONE and
             "NCCL GIN is unavailable. This is usually due to a network configuration issue, "
             "such as `allow_hybrid_mode=0` (disable direct RDMA kernels) in multi-plane network.");
 
-        const int num_rdma_ranks = ncclTeamRail(comm).nRanks;
-        EP_HOST_ASSERT(num_ranks == ncclTeamLsa(comm).nRanks * num_rdma_ranks);
-
-        const bool scaleout_active = num_rdma_ranks > 1;
+        const bool scaleout_active = num_rail_ranks > 1;
 
         // Only the unordered hybrid kernels use the shared-context weak-signal GIN
         // configuration; direct mode and the ordered hybrid kernels keep the
@@ -137,7 +140,7 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
             gin_config.gin_indexed_signals_cnt = 0;
         }
 
-        EP_HOST_ASSERT(gin_config.gin_indexed_signals_cnt >= (num_rdma_ranks - 1) and
+        EP_HOST_ASSERT(gin_config.gin_indexed_signals_cnt >= (num_rail_ranks - 1) and
                        "GIN indexed-signal budget cannot give each peer rail team a dedicated "
                        "signal; reduce num_allocated_qps to raise the per-context signal count");
 
@@ -177,6 +180,13 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
 
         reqs.ginConnectionType = allow_hybrid_mode ? NCCL_GIN_CONNECTION_RAIL: NCCL_GIN_CONNECTION_FULL;
     }
+
+    // The unordered hybrid path passes 0 and lets the GIN block above resolve it. That
+    // block does not run on a single NVLink domain, so resolve it here instead; with no
+    // GIN contexts provisioned the value is unused, but it still has to be in range.
+    if (this->num_allocated_qps == 0)
+        this->num_allocated_qps = elastic::gin_alloc::kDefaultGinContextCnt;
+
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
     reqs.useRuntimeVersion = true;
     dev_comm.ptr = malloc(props.devCommRuntimeVersionSize);
