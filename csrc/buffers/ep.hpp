@@ -89,7 +89,7 @@ public:
             num_workspace_bytes, num_buffer_bytes + num_lb_buffer_bytes, 0, true,
             allow_hybrid_mode, sl_idx, num_allocated_qps,
             0, num_cpu_timeout_secs, num_gpu_timeout_secs,
-            false, nullptr, allow_hybrid_mode and not use_ordered_hybrid_kernel());
+            false, nullptr, allow_hybrid_mode and not use_ordered_hybrid_kernel(), true);
         main_context = context;
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
         context->set_barrier_signals(&workspace.barrier_signals);

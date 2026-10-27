@@ -75,7 +75,8 @@ public:
             const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
             const bool& enable_lsa_multimem = false,
             const std::shared_ptr<Context>& main_context = nullptr,
-            const bool& unordered_gin_layout = false);
+            const bool& unordered_gin_layout = false,
+            const bool& gin_only_for_scaleout = false);
 
     std::tuple<int, int> get_physical_domain_size() const;
 
