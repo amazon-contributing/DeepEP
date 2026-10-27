@@ -53,8 +53,19 @@ __device__ __forceinline__ int64_t signal_delta(const uint64_t& signal, const ui
     return diff < kRange / 2 ? diff : diff - kRange;
 }
 
+__device__ __noinline__ void report_abort_and_trap() {
+    printf("DeepEP wait aborted, the communicator abort flag is set, sm: %d, thread: %d\n",
+           static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x));
+
+    // Wait another 1 second to let all threads print information and trap
+    const int64_t start_clock = clock64();
+    while (clock64() - start_clock < kNumOneSecCycles) {}
+    ptx::trap();
+}
+
 template <int64_t kNumTimeoutCycles, typename func_t>
 __device__ __forceinline__ void timeout_while(const bool& condition, const func_t& func,
+                                              uint32_t* abort_flag = nullptr,
                                               int64_t start_clock = 0) {
     // User may share a start clock for multiple waits
     if (start_clock == 0)
@@ -64,6 +75,10 @@ __device__ __forceinline__ void timeout_while(const bool& condition, const func_
         const bool timeout = clock64() - start_clock >= kNumTimeoutCycles;
         if (func(timeout))
             break;
+
+        // The communicator is being torn down, so abort and trap
+        if (abort_flag != nullptr and *reinterpret_cast<volatile uint32_t*>(abort_flag) != 0)
+            report_abort_and_trap();
 
         if (timeout) {
             // Wait another 1 second to let all threads print information and trap
@@ -75,8 +90,9 @@ __device__ __forceinline__ void timeout_while(const bool& condition, const func_
 }
 
 template <int64_t kNumTimeoutCycles, typename func_t>
-__device__ __forceinline__ void timeout_while(const func_t& func, const int64_t& start_clock = 0) {
-    timeout_while<kNumTimeoutCycles, func_t>(true, func, start_clock);
+__device__ __forceinline__ void timeout_while(const func_t& func, uint32_t* abort_flag = nullptr,
+                                              const int64_t& start_clock = 0) {
+    timeout_while<kNumTimeoutCycles, func_t>(true, func, abort_flag, start_clock);
 }
 
 template <int64_t kNumTimeoutCycles, typename gin_t, typename coop_t>
@@ -196,7 +212,7 @@ __forceinline__ __device__ void nvlink_barrier_wo_local_sync(
                    *workspace.get_nvl_barrier_counter_ptr());
         }
         return false;
-    });
+    }, gin.nccl_dev_comm.abortFlag);
 }
 
 template <int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs, int64_t kNumTimeoutCycles,

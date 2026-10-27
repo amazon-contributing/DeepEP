@@ -443,7 +443,7 @@ hybrid_combine_impl(nv_bfloat16* x,
                     }
                 }
                 return false;
-            });
+            }, nccl_dev_comm.abortFlag);
 
             // Increase received count
             #pragma unroll
@@ -615,7 +615,7 @@ hybrid_combine_impl(nv_bfloat16* x,
                            signal, expected_signal);
                 }
                 return false;
-            });
+            }, nccl_dev_comm.abortFlag);
         }
         __syncwarp();
     }
