@@ -96,7 +96,8 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
                  const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
                  const bool& enable_lsa_multimem,
                  const std::shared_ptr<Context>& main_context,
-                 const bool& unordered_gin_layout):
+                 const bool& unordered_gin_layout,
+                 const bool& gin_only_for_scaleout):
     rank_idx(rank_idx), num_ranks(num_ranks),
     gin_min_stride(1),
     num_allocated_qps(num_allocated_qps),
@@ -133,10 +134,18 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
     EP_HOST_ASSERT((not enable_lsa_multimem or props.multimemSupport) and
                    "NCCL multimem is unavailable");
 
+    const int num_rail_ranks = ncclTeamRail(comm).nRanks;
+    EP_HOST_ASSERT(num_ranks == ncclTeamLsa(comm).nRanks * num_rail_ranks);
+
     // Initialize NCCL device communicator
     ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
     reqs.lsaMultimem = enable_lsa_multimem;
-    if (get_env("EP_DISABLE_GIN", 0) == 0) {
+    // A buffer whose kernels use GIN only to reach peers off the NVLink domain (EP) can skip
+    // it on a single domain. The rail team size is that test in both modes: hybrid sets
+    // `num_scaleup_ranks = num_nvl_ranks`, and direct has `num_ranks = num_nvl_ranks *
+    // num_rail_ranks`. PP and Engram issue GIN even intranode, so they keep the default.
+    const bool gin_required = not gin_only_for_scaleout or num_rail_ranks > 1;
+    if (gin_required and get_env("EP_DISABLE_GIN", 0) == 0) {
         EP_HOST_ASSERT(
             (allow_hybrid_mode ? props.railedGinType : props.ginType) != NCCL_GIN_TYPE_NONE and
             "NCCL GIN is unavailable. This is usually due to a network configuration issue, "
@@ -167,7 +176,6 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
         // shared-context weak-signal GIN configuration; every other buffer, direct mode and
         // the ordered hybrid kernels keep NCCL's default requirements.
         if (allow_hybrid_mode and unordered_gin_layout) {
-            const int num_rail_ranks = ncclTeamRail(comm).nRanks;
             const bool scaleout_active = num_rail_ranks > 1;
 
             const int requested = num_allocated_qps == 0 ? gin_alloc::kDefaultGinContextCnt
@@ -219,6 +227,12 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
         if (std::getenv("EP_OVERRIDE_RDMA_SL") != nullptr)
             reqs.ginTrafficClass = get_env<int>("EP_OVERRIDE_RDMA_SL");
     }
+
+    // The unordered hybrid path passes 0 and lets the GIN block above resolve it. That
+    // block does not run on a single NVLink domain, so resolve it here instead; with no
+    // GIN contexts provisioned the value is unused, but it still has to be in range.
+    if (this->num_allocated_qps == 0)
+        this->num_allocated_qps = gin_alloc::kDefaultGinContextCnt;
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
     reqs.useRuntimeVersion = true;
