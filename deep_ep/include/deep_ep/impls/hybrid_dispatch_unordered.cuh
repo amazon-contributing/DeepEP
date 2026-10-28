@@ -1108,8 +1108,17 @@ hybrid_unordered_dispatch_impl(
         }
         __syncwarp();
 
-        if (lane_idx < kNumScaleoutRanks)
+        if (lane_idx < kNumScaleoutRanks) {
             *workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx) = 0;
+            if (lane_idx != scaleout_rank_idx) {
+                const auto src_buffer = scaleout_recv_buffer.get_rank_buffer(lane_idx);
+                #pragma unroll
+                for (int k = 0; k < kNumParts; ++ k) {
+                    for (int s = 0; s < num_sub_parts_at<kNumSubParts>(part_size(k)); ++ s)
+                        *src_buffer.get_token_buffer(sub_slot(k, s)).get_hdr_ptr() = 0;
+                }
+            }
+        }
         __syncwarp();
     }
 
