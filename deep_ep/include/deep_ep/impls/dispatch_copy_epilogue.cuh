@@ -1,6 +1,7 @@
 #pragma once
 
 #include <deep_ep/common/compiled.cuh>
+#include <deep_ep/common/diag.cuh>
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/math.cuh>
 #include <deep_ep/common/ptx.cuh>
@@ -126,6 +127,26 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         if (ptx::elect_one_sync())
             ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
         __syncwarp();
+
+        // Debug check. The full token is in shared memory now. Scan it before the store
+        if constexpr (EP_DEBUG_CHECKS) {
+            constexpr int kPayloadType = diag::get_dispatch_payload_type(kNumSFPacks);
+            const auto scan = diag::scan_nonfinite<kNumHiddenBytes, kPayloadType>(tma_buffer.get_hidden_ptr(), lane_idx);
+            if (scan.num_bad > 0) {
+                // `master_src_topk_idx` is -1 when no top-k entry is in range, for example on a corrupt token
+                const auto expert_idx = ptx::exchange(dst_expert_idx, master_src_topk_idx < 0 ? 0 : master_src_topk_idx);
+                if (ptx::elect_one_sync()) {
+                    const auto src_token_global_idx = *tma_buffer.get_src_token_global_idx_ptr();
+                    EP_DIAG_REPORT("DeepEP debug check: non-finite token in dispatch, rank: %d, recv token: %d/%d, "
+                                   "src rank: %d, src token: %d, local expert: %d, bad elements: %d/%d, first bad: %d (bits 0x%x)\n",
+                                   rank_idx, i, num_recv_tokens,
+                                   src_token_global_idx / kNumMaxTokensPerRank, src_token_global_idx % kNumMaxTokensPerRank,
+                                   expert_idx, scan.num_bad, kNumHiddenBytes / diag::get_payload_elem_bytes(kPayloadType),
+                                   scan.first_bad_idx, scan.first_bad_bits);
+                }
+            }
+            __syncwarp();
+        }
 
         // Maintain linked list
         if constexpr (kDoCreateLinkedList) {
