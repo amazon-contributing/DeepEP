@@ -356,6 +356,7 @@ The library provides some environment variables, which may be useful:
     - `EP_JIT_DUMP_SASS`: `0` or `1`, dump SASS output, `0` by default
 - Debug and profiling
     - `EP_GIN_GDAKI_DEBUG`: `0` or `1`, enable NCCL Gin GDAKI debugging output, `0` by default
+    - `EP_DEBUG_CHECKS`: `0` or `1`, compile the kernels with the debug checks. The dispatch and combine epilogues scan each token for NaN and Inf before they store it, and print where a bad token came from. `0` by default
     - `EP_USE_NVIDIA_TOOLS`: `0` or `1`, skip internal profiling when running under external NVIDIA tools, `0` by default
     - `EP_DISABLE_BARRIER_PROFILING`: `0` or `1`, disable barrier-based communication profiling in benchmarks, `0` by default
 - Build
