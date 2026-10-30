@@ -51,8 +51,6 @@ class EPBuffer: public BufferBase {
     // Whether to prefer overlapping communication with compute (use more SMs and channels if false)
     bool prefer_overlap_with_compute;
 
-    mutable int dispatch_iteration = 0;
-
     // Some EP hybrid mode settings
     static constexpr int kNumMaxChannelsPerSM = 8;
     static constexpr int kNumMaxSMs = 160;
@@ -95,6 +93,9 @@ public:
         main_context = context;
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
         context->set_barrier_signals(&workspace.barrier_signals);
+        // The unordered dispatch tells a landed sub-part from an empty slot by the header's
+        // written bit alone, so the receive buffer must start zeroed
+        CUDA_RUNTIME_CHECK(cudaMemset(context->buffer, 0, num_buffer_bytes));
 
         // Expose only the LB region; the preceding bytes remain reserved for EP communication.
         lb_storage = torch::from_blob(
@@ -668,8 +669,6 @@ public:
         std::fill_n(host_workspace_layout.get_scaleup_expert_count_ptr<false>(), num_local_experts, 0);
         std::atomic_thread_fence(std::memory_order_seq_cst);
 
-        ++ dispatch_iteration;
-
         // Do dispatch into the buffers (with SM limitation)
         launch_dispatch(x.data_ptr(), sf_ptr,
                         topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
@@ -697,7 +696,6 @@ public:
                         cached_mode, do_cpu_sync,
                         not prefer_overlap_with_compute,
                         allow_multiple_reduction, do_expand,
-                        dispatch_iteration,
                         comm_stream);
 
         // For tensor recording

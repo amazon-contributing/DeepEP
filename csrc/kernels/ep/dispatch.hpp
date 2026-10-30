@@ -74,7 +74,6 @@ static void launch_dispatch(void* x, void* sf,
                             // Expanded dispatch. Selects the matching slot encoding for the combine
                             // this handle feeds; direct dispatch ignores it.
                             const bool& do_expand,
-                            const int& dispatch_iteration,
                             const at::cuda::CUDAStream& stream) {
     // Cached mode does not support expert token counting
     if (cached_mode)
@@ -218,8 +217,7 @@ static void __instantiate_kernel() {{
             nccl_dev_comm, nccl_window,
             buffer,
             workspace, mapped_host_workspace,
-            scaleout_rank_idx, scaleup_rank_idx,
-            dispatch_iteration
+            scaleout_rank_idx, scaleup_rank_idx
         );
     }
 }
