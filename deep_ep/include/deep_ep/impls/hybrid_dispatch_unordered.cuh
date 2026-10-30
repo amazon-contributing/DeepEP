@@ -25,19 +25,16 @@ namespace deep_ep::elastic {
 
 static constexpr int64_t kScaleoutHeaderWrittenBit = static_cast<int64_t>(1) << 63;
 
-__device__ __forceinline__ int64_t pack_scaleout_header(const int& iteration, const int& count,
-                                                        const bool& more) {
+__device__ __forceinline__ int64_t pack_scaleout_header(const int& count, const bool& more) {
     return kScaleoutHeaderWrittenBit
-         | (static_cast<int64_t>(iteration & 0x7fffffff) << 32)
          | (static_cast<int64_t>(count & 0x3fffffff) << 1)
          | (more ? static_cast<int64_t>(1) : static_cast<int64_t>(0));
 }
 
-__device__ __forceinline__ bool unpack_scaleout_header(const int64_t& header, const int& iteration,
-                                                       int& count, bool& more) {
+__device__ __forceinline__ bool unpack_scaleout_header(const int64_t& header, int& count, bool& more) {
     count = static_cast<int>((header >> 1) & 0x3fffffff);
     more = (header & 0x1) != 0;
-    return header < 0 and ((header >> 32) & 0x7fffffff) == (iteration & 0x7fffffff);
+    return header < 0;
 }
 
 #ifndef EP_NUM_SUB_PARTS
@@ -183,8 +180,7 @@ hybrid_unordered_dispatch_impl(
     const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
     void* buffer,
     void* workspace, void* mapped_host_workspace,
-    const int scaleout_rank_idx, const int scaleup_rank_idx,
-    const int dispatch_iteration) {
+    const int scaleout_rank_idx, const int scaleup_rank_idx) {
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     constexpr int kNumExpertsPerScaleout = kNumExperts / kNumScaleoutRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0, "Invalid number of experts or ranks");
@@ -519,7 +515,7 @@ hybrid_unordered_dispatch_impl(
         const auto stage_part_header = [&](layout::BufferLayout<false>& send_ch,
                                            const int& slot, const int& count, const bool& more) {
             auto* hdr = send_ch.get_token_buffer(slot).get_hdr_ptr();
-            *hdr = pack_scaleout_header(dispatch_iteration, count, more);
+            *hdr = pack_scaleout_header(count, more);
             ptx::fence_acq_rel_sys();
         };
         scaleout_recv_buffer = scaleout_recv_buffer.get_rank_buffer(scaleout_rank_idx);
@@ -887,7 +883,7 @@ hybrid_unordered_dispatch_impl(
                         if (s < num_subs) {
                             sub_valid[s] = is_remote_src and
                                 unpack_scaleout_header(read_batch_header(lane_idx, k, s),
-                                                       dispatch_iteration, sub_count[s], sub_more[s]);
+                                                       sub_count[s], sub_more[s]);
                             num_valid += __popc(ptx::gather(sub_valid[s]));
                         }
                     }
