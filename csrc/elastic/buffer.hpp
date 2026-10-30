@@ -56,8 +56,6 @@ class ElasticBuffer {
     // Whether to allow multiple reductions
     bool allow_multiple_reduction;
 
-    mutable int dispatch_iteration = 0;
-
     // Whether to prefer overlapping communication with compute (use more SMs and channels if false)
     bool prefer_overlap_with_compute;
 
@@ -143,6 +141,9 @@ public:
             workspace, nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks, 0);
         buffer = static_cast<uint8_t*>(workspace) + num_workspace_bytes;
         CUDA_RUNTIME_CHECK(cudaMemset(workspace, 0, num_workspace_bytes));
+        // The unordered dispatch tells a landed sub-part from an empty slot by the header's
+        // written bit alone, so the receive buffer must start zeroed
+        CUDA_RUNTIME_CHECK(cudaMemset(buffer, 0, num_gpu_buffer_bytes));
 
         // Allocate host workspaces
         CUDA_RUNTIME_CHECK(cudaMallocHost(&host_workspace, layout::WorkspaceLayout::get_num_bytes(), cudaHostAllocMapped));
@@ -1087,8 +1088,6 @@ public:
         std::fill_n(host_workspace_layout.get_scaleup_expert_count_ptr<false>(), num_local_experts, 0);
         std::atomic_thread_fence(std::memory_order_seq_cst);
 
-        ++ dispatch_iteration;
-
         // Do dispatch into the buffers (with SM limitation)
         EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
         launch_dispatch(x.data_ptr(), sf_ptr,
@@ -1118,7 +1117,6 @@ public:
                         cached_mode, do_cpu_sync,
                         not prefer_overlap_with_compute,
                         allow_multiple_reduction, do_expand,
-                        dispatch_iteration,
                         comm_stream);
 
         // Received token counters

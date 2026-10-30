@@ -71,7 +71,6 @@ public:
         void* buffer;
         void* workspace; void* mapped_host_workspace;
         int scaleout_rank_idx, scaleup_rank_idx;
-        int dispatch_iteration;
 
         jit::LaunchArgs launch_args;
     };
@@ -184,8 +183,7 @@ static void __instantiate_kernel() {{
                 args.nccl_dev_comm, args.nccl_window,
                 args.buffer,
                 args.workspace, args.mapped_host_workspace,
-                args.scaleout_rank_idx, args.scaleup_rank_idx,
-                args.dispatch_iteration
+                args.scaleout_rank_idx, args.scaleup_rank_idx
             ));
         }
     }
@@ -237,7 +235,6 @@ static void launch_dispatch(void* x, void* sf,
                             // Expanded dispatch. Selects the matching slot encoding for the combine
                             // this handle feeds; direct dispatch ignores it.
                             const bool& do_expand,
-                            const int& dispatch_iteration,
                             const at::cuda::CUDAStream& stream) {
     // Cached mode does not support expert token counting
     if (cached_mode)
@@ -304,7 +301,6 @@ static void launch_dispatch(void* x, void* sf,
         .buffer = buffer,
         .workspace = workspace, .mapped_host_workspace = mapped_host_workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
-        .dispatch_iteration = dispatch_iteration,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)};
     const auto code = DispatchRuntime::generate(args);
