@@ -338,4 +338,33 @@ struct BufferLayout {
     }
 };
 
+// Tail word of a channel's per-peer forward list when the unordered dispatch records two FIFOs
+// (an ordered-dispatch tail is a plain non-negative list index):
+//   bit 31       tag
+//   bits 30..16  number of local tokens, recorded from the list top downward
+//   bits 15..0   number of remote tokens, recorded from entry 0 upward
+constexpr unsigned kForwardFifoTag = 0x80000000u;
+constexpr int kForwardFifoRemoteMask = 0xffff;
+constexpr int kForwardFifoLocalShift = 16;
+constexpr int kForwardFifoLocalMask = 0x7fff;
+
+template <int kForwardListTop>
+__forceinline__ __device__ __host__ int pack_forward_fifo_tails(const int& num_remote, const int& num_local) {
+    EP_STATIC_ASSERT(kForwardListTop <= kForwardFifoLocalMask, "The FIFO lengths must fit in 15 bits");
+    return static_cast<int>(kForwardFifoTag | static_cast<unsigned>(num_remote) |
+                            (static_cast<unsigned>(num_local) << kForwardFifoLocalShift));
+}
+
+__forceinline__ __device__ __host__ bool is_forward_fifo_tails(const int& tail) {
+    return tail < 0;
+}
+
+__forceinline__ __device__ __host__ int forward_fifo_num_remote(const int& tail) {
+    return tail & kForwardFifoRemoteMask;
+}
+
+__forceinline__ __device__ __host__ int forward_fifo_num_local(const int& tail) {
+    return (tail >> kForwardFifoLocalShift) & kForwardFifoLocalMask;
+}
+
 }  // namespace deep_ep::elastic

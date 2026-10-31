@@ -216,9 +216,15 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
             #pragma unroll
             for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
                 if (const auto k = j * 32 + lane_idx; j < (kNumScaleupRanksPerLane - 1) or k < kNumScaleupRanks) {
-                    channel_linked_list[
-                        *workspace_layout.get_channel_scaleup_tail_ptr(i, k)
-                    ] = -1;
+                    const int tail = *workspace_layout.get_channel_scaleup_tail_ptr(i, k);
+                    if (not layout::is_forward_fifo_tails(tail)) {
+                        channel_linked_list[tail] = -1;
+                    } else {
+                        constexpr int kForwardListTop = kNumScaleoutRanks * kNumMaxTokensPerChannel;
+                        const auto entry = [i, k](const int& idx) { return i * ((kForwardListTop + 1) * kNumScaleupRanks) + idx * kNumScaleupRanks + k; };
+                        channel_linked_list[entry(layout::forward_fifo_num_remote(tail))] = -1;
+                        channel_linked_list[entry(kForwardListTop - layout::forward_fifo_num_local(tail))] = -1;
+                    }
 
                     // Clean for combine usages
                     *workspace_layout.get_channel_scaleup_tail_ptr(i, k) = 0;

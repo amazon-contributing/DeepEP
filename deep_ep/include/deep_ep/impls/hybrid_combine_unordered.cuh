@@ -185,20 +185,24 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
         // Shape of `channel_linked_list`: `[kNumChannels, kNumMaxTokensPerChannel + 1, kNumScaleupRanks]`
         // Iterate until all scale-up peers finish
+        constexpr int kForwardListTop = kNumScaleoutRanks * kNumMaxTokensPerChannel;
         int dst_scaleup_rank_idx = channel_idx;
-        int stored_ll_idx[kNumScaleupRanksPerLane] = {}, stored_token_idx[kNumScaleupRanksPerLane] = {};
+        int stored_ll_idx[kNumScaleupRanksPerLane] = {}, stored_ll_step[kNumScaleupRanksPerLane] = {}, stored_token_idx[kNumScaleupRanksPerLane] = {};
         #pragma unroll
         for (int i = 0; i < kNumScaleupRanksPerLane; ++ i)
-            stored_token_idx[i] = -1;
+            stored_token_idx[i] = -1, stored_ll_step[i] = 1;
         while (true) {
             // Load token indices in the list
             #pragma unroll
             for (int i = 0; i < kNumScaleupRanksPerLane; ++ i) {
                 const auto j = i * 32 + lane_idx;
-                stored_token_idx[i] = i < (kNumScaleupRanksPerLane - 1) or j < kNumScaleupRanks ?
-                    __ldg(channel_linked_list +
-                          channel_idx * (kNumScaleoutRanks * kNumMaxTokensPerChannel + 1) * kNumScaleupRanks +
-                          stored_ll_idx[i] * kNumScaleupRanks + j) : -1;
+                const bool valid = i < (kNumScaleupRanksPerLane - 1) or j < kNumScaleupRanks;
+                const auto list = channel_linked_list + channel_idx * (kForwardListTop + 1) * kNumScaleupRanks + j;
+                stored_token_idx[i] = valid ? __ldg(list + stored_ll_idx[i] * kNumScaleupRanks) : -1;
+                if (stored_token_idx[i] < 0 and stored_ll_step[i] > 0) {
+                    stored_ll_idx[i] = kForwardListTop, stored_ll_step[i] = -1;
+                    stored_token_idx[i] = valid ? __ldg(list + stored_ll_idx[i] * kNumScaleupRanks) : -1;
+                }
             }
             __syncwarp();
 
@@ -379,7 +383,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             // Move linked list
             #pragma unroll
             for (int i = 0; i < kNumScaleupRanksPerLane; ++ i)
-                stored_ll_idx[i] += (stored_token_idx[i] >= 0);
+                stored_ll_idx[i] += stored_token_idx[i] >= 0 ? stored_ll_step[i] : 0;
         }
 
         // Update for the unissued ones
@@ -483,9 +487,14 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         };
 
         // Replay the dispatch
+        constexpr int kForwardListTop = kNumScaleoutRanks * kNumMaxTokensPerChannel;
         int stored_num_tokens_recv[kNumScaleupRanksPerLane] = {}, stored_cached_scaleup_tail[kNumScaleupRanksPerLane] = {};
-        for (int i = 0; ; ++ i) {
-            const auto src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
+        for (int i = 0, step = 1; ; i += step) {
+            auto src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
+            if (src_token_global_idx < 0 and step > 0) {
+                i = kForwardListTop, step = -1;
+                src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
+            }
             const auto src_rank_idx = src_token_global_idx / kNumMaxTokensPerRank;
             const auto src_scaleout_rank_idx = src_rank_idx / kNumScaleupRanks;
             const auto src_token_idx = src_token_global_idx % kNumMaxTokensPerRank;
