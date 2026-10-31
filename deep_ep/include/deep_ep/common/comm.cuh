@@ -79,12 +79,30 @@ __device__ __forceinline__ void timeout_while(const func_t& func, const int64_t&
     timeout_while<kNumTimeoutCycles, func_t>(true, func, start_clock);
 }
 
+static __device__ __forceinline__ void report_gin_queue(const char* where, const ncclGinCtx ctx,
+                                                     const int scaleout_rank_idx, const int scaleup_rank_idx) {
+#if NCCL_GIN_EFA_GDA_ENABLE
+    if (ctx.backend != NCCL_NET_DEVICE_GIN_EFA_GDA)
+        return;
+    const auto& ep = nccl::gin::efa_gda::getDevHandle(ctx)->data;
+    const auto posted = static_cast<uint32_t>(*reinterpret_cast<const volatile uint64_t*>(&ep.submitted_count));
+    const auto completed = static_cast<uint32_t>(nccl::gin::efa_gda::hwCounterLoad<cuda::memory_order_relaxed>(ep.local_cntr_value));
+    printf("DeepEP GIN queue state (%s), scale-out: %d, scale-up: %d, sm: %d, thread: %d, ctx: %d, "
+           "WQEs posted: %u, completed by the NIC: %u, not completed: %u\n",
+           where, scaleout_rank_idx, scaleup_rank_idx, static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x),
+           ctx.contextId, posted, completed, (posted - completed) & nccl::gin::efa_gda::EFA_CNTR_MASK);
+#endif
+}
+
 template <int64_t kNumTimeoutCycles, typename gin_t, typename coop_t>
-__device__ __forceinline__ void flush_with_timeout(const gin_t& gin, const coop_t& coop) {
+__device__ __forceinline__ void flush_with_timeout(const gin_t& gin, const coop_t& coop,
+                                                   const int& scaleout_rank_idx = -1, const int& scaleup_rank_idx = -1) {
     if (gin.flush(coop, cuda::memory_order_acquire, ncclGin_None{},
                   static_cast<uint64_t>(kNumTimeoutCycles)) != ncclSuccess) {
         printf("DeepEP Gin flush timeout, sm: %d, thread: %d\n",
                static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x));
+        if (threadIdx.x % 32 == __ffs(__activemask()) - 1)
+            report_gin_queue("flush", gin._makeCtx(), scaleout_rank_idx, scaleup_rank_idx);
         ptx::trap();
     }
 }
@@ -259,6 +277,7 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
                 printf("DeepEP Gin barrier timeout, tag: %d, scaleout: %d, scaleup: %d, thread: %d, "
                        "slot: %d, target: %lu\n", kTag, scaleout_rank_idx, scaleup_rank_idx, thread_idx,
                        static_cast<int>(signal_idx), target);
+                report_gin_queue("Gin barrier", gin._makeCtx(), scaleout_rank_idx, scaleup_rank_idx);
                 // Wait another 1 second to let all threads print information and
                 // trap similar to timeout_while
                 const auto stop = clock64() + kNumOneSecCycles;
