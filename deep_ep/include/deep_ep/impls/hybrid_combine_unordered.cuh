@@ -819,9 +819,14 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx) {
                     ring_signal_id[forward_warp_idx] = static_cast<ncclGinSignal_t>(
                         comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
-                    const auto [qp, mode] =
+                    const auto [qp, mapped_mode] =
                         comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx);
-                    new (&gin_ctx[forward_warp_idx]) handle::NCCLGin(nccl_dev_comm, nccl_window, qp, mode);
+                    // This lane is the only poster on a QP this SM owns (CTA in the mapping),
+                    // so the handle can be thread-exclusive; a QP shared across SMs stays GPU.
+                    const auto rail_mode = mapped_mode == NCCL_GIN_RESOURCE_SHARING_GPU
+                                             ? NCCL_GIN_RESOURCE_SHARING_GPU
+                                             : NCCL_GIN_RESOURCE_SHARING_THREAD;
+                    new (&gin_ctx[forward_warp_idx]) handle::NCCLGin(nccl_dev_comm, nccl_window, qp, rail_mode);
                 }
 
                 while (num_forward_warps_done_cnt < kNumForwardWarps) {
