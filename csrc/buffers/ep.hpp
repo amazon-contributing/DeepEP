@@ -93,9 +93,6 @@ public:
         main_context = context;
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
         context->set_barrier_signals(&workspace.barrier_signals);
-        // The unordered dispatch tells a landed sub-part from an empty slot by the header's
-        // written bit alone, so the receive buffer must start zeroed
-        CUDA_RUNTIME_CHECK(cudaMemset(context->buffer, 0, num_buffer_bytes));
 
         // Expose only the LB region; the preceding bytes remain reserved for EP communication.
         lb_storage = torch::from_blob(
