@@ -268,6 +268,23 @@ hybrid_unordered_dispatch_impl(
     auto scaleout_recv_buffer = layout::BufferLayout<false>(
         scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleout_send_buffer.get_buffer_end_ptr());
 
+    // Zero the in-band headers of the remote sources before the entry barrier. The header words
+    // live in `buffer`, which the combine and other kernels also write between two dispatches, so
+    // they hold arbitrary data here. No remote sender writes them before it passes the barrier.
+    // The release fence orders the zeros before the barrier signal below, which is what lets the
+    // peers start putting into these slots. Nothing here reads what a peer wrote, so release is enough.
+    if (is_forward_warp and lane_idx < kNumScaleoutRanks and lane_idx != scaleout_rank_idx) {
+        const auto src_buffer = scaleout_recv_buffer
+            .get_channel_buffer<kNumSlotsPerChannel>(sm_idx * kNumChannelsPerSM + fwd_warp_idx)
+            .get_rank_buffer(lane_idx);
+        #pragma unroll
+        for (int k = 0; k < kNumParts; ++ k) {
+            for (int s = 0; s < num_sub_parts_at<kNumSubParts>(part_size(k)); ++ s)
+                *src_buffer.get_token_buffer(sub_slot(k, s)).get_hdr_ptr() = 0;
+        }
+        ptx::fence_release_sys();
+    }
+
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
@@ -1104,17 +1121,8 @@ hybrid_unordered_dispatch_impl(
         }
         __syncwarp();
 
-        if (lane_idx < kNumScaleoutRanks) {
+        if (lane_idx < kNumScaleoutRanks)
             *workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx) = 0;
-            if (lane_idx != scaleout_rank_idx) {
-                const auto src_buffer = scaleout_recv_buffer.get_rank_buffer(lane_idx);
-                #pragma unroll
-                for (int k = 0; k < kNumParts; ++ k) {
-                    for (int s = 0; s < num_sub_parts_at<kNumSubParts>(part_size(k)); ++ s)
-                        *src_buffer.get_token_buffer(sub_slot(k, s)).get_hdr_ptr() = 0;
-                }
-            }
-        }
         __syncwarp();
     }
 
