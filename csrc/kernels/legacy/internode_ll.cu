@@ -281,7 +281,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec& vec, float SFScaleVal, uint8
   return e2m1Vec;
 }
 
-template <bool kUseFP8, bool kUseUE8M0, bool kUseNVFP4, int kHidden>
+template <bool kUseFP8, bool kUseUE8M0, bool kUseNVFP4, int kHidden, bool kUsePreQuantizedNVFP4 = false>
 __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                                                     void* packed_recv_x_scales,
                                                     int* packed_recv_src_info,
@@ -309,7 +309,11 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                                                     int num_warp_groups,
                                                     int num_warps_per_group,
                                                     bool round_scale,
-                                                    int phases) {
+                                                    int phases,
+                                                    const void* x_scales,
+                                                    const float* per_token_scale,
+                                                    float* packed_recv_per_token_scale,
+                                                    bool swizzle_scales) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto warp_id = thread_id / 32, lane_id = get_lane_id();
@@ -325,12 +329,13 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     using packed_t = std::conditional_t<kUseUE8M0 || kUseNVFP4, uint32_t, float>;
     EP_STATIC_ASSERT(sizeof(packed_t) % sizeof(scale_t) == 0, "Invalid vector length");
     EP_STATIC_ASSERT(!(kUseFP8 && kUseNVFP4), "FP8 and NVFP4 cannot be used together");
+    EP_STATIC_ASSERT(!(kUsePreQuantizedNVFP4 && (kUseFP8 || kUseNVFP4)), "Pre-quantized NVFP4 does not cast");
 
     // FP8 staffs
     constexpr int kNumPerChannels = kUseNVFP4 ? 16 : 128;
     const int num_scales = kHidden / kNumPerChannels;
     constexpr size_t hidden_bytes =
-    kUseNVFP4
+    (kUseNVFP4 || kUsePreQuantizedNVFP4)
         ? kHidden * sizeof(__nv_fp8_storage_t) / 2
         : kHidden * (kUseFP8 ? sizeof(__nv_fp8_storage_t) : sizeof(nv_bfloat16));
     const size_t hidden_int4 = hidden_bytes / sizeof(int4);
@@ -342,7 +347,13 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         int32_t,
         std::conditional_t<kUseFP8, int2, int4>>;
     using rdma_x_scale_t = std::conditional_t<kUseNVFP4, uint8_t, float>;
-    const size_t num_bytes_per_msg = sizeof(int4) + ((kUseFP8 || kUseNVFP4) ? (hidden_bytes + num_scales * sizeof(rdma_x_scale_t)) : hidden_bytes);
+    // Pre-quantized NVFP4 stores one E4M3 byte per 16 elements after the payload,
+    // and its FP32 per-token scale in the second header word.
+    constexpr int kNumPreQuantizedScaleInt4 = kHidden / 16 / sizeof(int4);
+    EP_STATIC_ASSERT(!kUsePreQuantizedNVFP4 || kHidden % (16 * sizeof(int4)) == 0, "Invalid hidden");
+    const size_t num_bytes_per_msg = sizeof(int4) +
+        ((kUseFP8 || kUseNVFP4) ? (hidden_bytes + num_scales * sizeof(rdma_x_scale_t))
+                                : (kUsePreQuantizedNVFP4 ? hidden_bytes + kHidden / 16 : hidden_bytes));
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
@@ -380,10 +391,24 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                 SFScaleVal = *(static_cast<const float*>(x_global_scale));
             }
 
+            if constexpr (kUsePreQuantizedNVFP4) {
+                // Copy packed values and scales without arithmetic
+                if (thread_id == 0)
+                    rdma_x_src_idx[1] = __float_as_int(per_token_scale == nullptr ? 1.0f : __ldg(per_token_scale + token_idx));
+                const auto src_x = static_cast<const int4*>(x) + token_idx * hidden_int4;
+                const auto dst_x = reinterpret_cast<int4*>(rdma_x_vec);
+                for (int i = thread_id; i < hidden_int4; i += num_threads)
+                    dst_x[i] = __ldg(src_x + i);
+                const auto src_scales = static_cast<const int4*>(x_scales) + token_idx * kNumPreQuantizedScaleInt4;
+                const auto dst_scales = reinterpret_cast<int4*>(rdma_x_scales);
+                for (int i = thread_id; i < kNumPreQuantizedScaleInt4; i += num_threads)
+                    dst_scales[i] = __ldg(src_scales + i);
+            }
+
             // FP8 or NVFP4 cast
             EP_STATIC_ASSERT(hidden_bf16_int4 % 32 == 0, "Must use the full warp to reduce");
             #pragma unroll
-            for (int i = thread_id; i < hidden_bf16_int4; i += num_threads) {
+            for (int i = thread_id; i < (kUsePreQuantizedNVFP4 ? 0 : hidden_bf16_int4); i += num_threads) {
                 // Read
                 auto int4_value = __ldg(x_int4 + i);
 
@@ -622,7 +647,28 @@ LOW_LATENCY_DISPATCH_RECV:
             UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, ld_nc_global, st_na_global);
 
             // Copy scales
-            if constexpr (kUseFP8) {
+            if constexpr (kUsePreQuantizedNVFP4) {
+                const auto row = local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank + recv_token_begin_idx + i;
+                if (swizzle_scales) {
+                    // Same layout as `use_nvfp4`: physical (l, rm, rk, 32, 4, 4), one 4-scale pack per int
+                    constexpr int kNumScalePacks = kHidden / 64;
+                    const auto token_idx = recv_token_begin_idx + i;
+                    const auto src_scales = reinterpret_cast<const int*>(reinterpret_cast<const uint8_t*>(src_data) + hidden_bytes);
+                    const auto dst_scales = static_cast<int*>(packed_recv_x_scales) +
+                        local_expert_idx * num_aligned_tokens * kNumScalePacks + (token_idx / 128) * kNumScalePacks * 128 +
+                        (token_idx % 32) * 4 + (token_idx % 128) / 32;
+                    for (int j = lane_id; j < kNumScalePacks; j += 32)
+                        st_na_global(dst_scales + j * 128, ld_nc_global(src_scales + j));
+                } else {
+                    // Keep scales in the same linear layout as the input
+                    const auto src_scales = reinterpret_cast<const int4*>(reinterpret_cast<const uint8_t*>(src_data) + hidden_bytes);
+                    const auto dst_scales = static_cast<int4*>(packed_recv_x_scales) + row * kNumPreQuantizedScaleInt4;
+                    for (int j = lane_id; j < kNumPreQuantizedScaleInt4; j += 32)
+                        dst_scales[j] = ld_nc_global(src_scales + j);
+                }
+                if (lane_id == 0 and packed_recv_per_token_scale != nullptr)
+                    packed_recv_per_token_scale[row] = __int_as_float(ld_nc_global(src_src_idx + 1));
+            } else if constexpr (kUseFP8) {
                 // Equivalent CuTe layout:
                 //   (num_tokens, (num_packed, num_elems_per_pack)):(num_elems_per_pack, (num_tokens * num_elems_per_pack, 1))
                 const auto src_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
@@ -701,7 +747,12 @@ void dispatch(void* packed_recv_x,
               void* workspace,
               int num_device_sms,
               cudaStream_t stream,
-              int phases) {
+              int phases,
+              bool use_prequantized_nvfp4,
+              const void* x_scales,
+              const float* per_token_scale,
+              float* packed_recv_per_token_scale,
+              bool swizzle_scales) {
     constexpr int kNumMaxTopK = 16;  // Kimi-K3 routes top-16
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
@@ -732,6 +783,8 @@ void dispatch(void* packed_recv_x,
             dispatch_func = dispatch<false, false, true, hidden>; \
         if (use_nvfp4 and use_ue8m0)                         \
             dispatch_func = dispatch<false, true, true, hidden>; \
+        if (use_prequantized_nvfp4)                          \
+            dispatch_func = dispatch<false, false, false, hidden, true>; \
         LAUNCH_KERNEL(&cfg,                                  \
                       dispatch_func,                         \
                       packed_recv_x,                         \
@@ -761,10 +814,15 @@ void dispatch(void* packed_recv_x,
                       num_warp_groups,                       \
                       num_warps_per_group,                   \
                       round_scale,                           \
-                      phases);                               \
+                      phases,                                \
+                      x_scales,                              \
+                      per_token_scale,                       \
+                      packed_recv_per_token_scale,           \
+                      swizzle_scales);                       \
     }                                                        \
     break
 
+    EP_HOST_ASSERT(not(use_prequantized_nvfp4 and (use_fp8 or use_nvfp4)));
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE

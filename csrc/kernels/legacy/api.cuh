@@ -288,7 +288,12 @@ void dispatch(void* packed_recv_x,
               void* workspace,
               int num_device_sms,
               cudaStream_t stream,
-              int phases);
+              int phases,
+              bool use_prequantized_nvfp4 = false,
+              const void* x_scales = nullptr,
+              const float* per_token_scale = nullptr,
+              float* packed_recv_per_token_scale = nullptr,
+              bool swizzle_scales = false);
 
 void combine(void* combined_x,
              void* rdma_recv_x,
