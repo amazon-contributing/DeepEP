@@ -141,9 +141,6 @@ public:
             workspace, nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks, 0);
         buffer = static_cast<uint8_t*>(workspace) + num_workspace_bytes;
         CUDA_RUNTIME_CHECK(cudaMemset(workspace, 0, num_workspace_bytes));
-        // The unordered dispatch tells a landed sub-part from an empty slot by the header's
-        // written bit alone, so the receive buffer must start zeroed
-        CUDA_RUNTIME_CHECK(cudaMemset(buffer, 0, num_gpu_buffer_bytes));
 
         // Allocate host workspaces
         CUDA_RUNTIME_CHECK(cudaMallocHost(&host_workspace, layout::WorkspaceLayout::get_num_bytes(), cudaHostAllocMapped));
