@@ -12,6 +12,7 @@
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include <deep_ep/common/compiled.cuh>
+#include <deep_ep/common/diag.cuh>
 #include <deep_ep/common/ptx.cuh>
 #include <deep_ep/common/layout.cuh>
 
@@ -162,6 +163,18 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
         );
         ptx::tma_store_fence();
         __syncwarp();
+
+        // Debug check. The reduced token is in shared memory now. Scan it before the store
+        if constexpr (EP_DEBUG_CHECKS) {
+            const auto scan = diag::scan_nonfinite<kNumHiddenBytes, diag::kPayloadBF16>(tma_buffer.get_base_ptr(), lane_idx);
+            if (scan.num_bad > 0 and ptx::elect_one_sync()) {
+                EP_DIAG_REPORT("DeepEP debug check: non-finite token in combine, rank: %d, token: %d/%d, "
+                               "sources: %d, bad elements: %d/%d, first bad: %d (bits 0x%x)\n",
+                               scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx, token_idx, num_combined_tokens,
+                               __popc(reduce_valid_mask), scan.num_bad, kHidden, scan.first_bad_idx, scan.first_bad_bits);
+            }
+            __syncwarp();
+        }
 
         // Issue TMA copy
         if (ptx::elect_one_sync()) {

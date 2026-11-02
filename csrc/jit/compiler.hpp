@@ -64,6 +64,8 @@ public:
             flags += " -Xcompiler -rdynamic -lineinfo";
         if (get_env("EP_GIN_GDAKI_DEBUG", 0))
             flags += " -DNCCL_DEVICE_GIN_GDAKI_ENABLE_DEBUG=1";
+        if (get_env("EP_DEBUG_CHECKS", 0))
+            flags += " -DEP_DEBUG_CHECKS=1";
         flags += fmt::format(" -I {}/include", nccl_root.c_str());
 
         // Some special flags for EP
