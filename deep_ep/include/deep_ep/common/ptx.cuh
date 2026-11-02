@@ -526,6 +526,10 @@ __device__ __forceinline__ void fence_acq_rel_sys() {
     asm volatile("fence.acq_rel.sys;" ::: "memory");
 }
 
+__device__ __forceinline__ void fence_release_sys() {
+    asm volatile("fence.release.sys;" ::: "memory");
+}
+
 /// Intrinsics
 template <typename dtype_t>
 __device__ __forceinline__ dtype_t exchange(dtype_t ptr, const int& src_lane_idx) {
