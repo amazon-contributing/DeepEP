@@ -197,7 +197,8 @@ static void* launch_combine(void* x,
             const int64_t proxy_ring_bytes = deep_ep::elastic::ProxyRingLayout::get_num_bytes(
                 num_forward_warps, deep_ep::elastic::kProxyRingDepthDefault);
             // The channel auto-tuner should prevent this assert from firing; leaving it as a sanity check.
-            EP_HOST_ASSERT(tma_smem_bytes + proxy_ring_bytes <= num_smem_bytes and
+            const int nanny_smem_bytes = (get_debug_checks() & kDebugCheckNanny) != 0 ? kNumNannySmemBytes : 0;
+            EP_HOST_ASSERT(tma_smem_bytes + proxy_ring_bytes <= num_smem_bytes - nanny_smem_bytes and
                            "Combine TMA buffers + proxy rings exceed per-block shared memory");
         }
     }
