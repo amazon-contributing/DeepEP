@@ -83,9 +83,34 @@ template <int64_t kNumTimeoutCycles, typename gin_t, typename coop_t>
 __device__ __forceinline__ void flush_with_timeout(const gin_t& gin, const coop_t& coop) {
     if (gin.flush(coop, cuda::memory_order_acquire, ncclGin_None{},
                   static_cast<uint64_t>(kNumTimeoutCycles)) != ncclSuccess) {
-        printf("DeepEP Gin flush timeout, sm: %d, thread: %d\n",
-               static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x));
+        if constexpr (kReportGinQueue) {
+            // Name the context and give the other warps' timeout reports a second to print before the trap
+            printf("DeepEP Gin flush timeout, sm: %d, thread: %d, ctx: %d\n",
+                   static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x), static_cast<int>(gin.contextId));
+            const auto stop = clock64() + kNumOneSecCycles;
+            while (clock64() < stop) {}
+        } else {
+            printf("DeepEP Gin flush timeout, sm: %d, thread: %d\n",
+                   static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x));
+        }
         ptx::trap();
+    }
+}
+
+// With the `queue` check on, a timed flush after a network-wait timeout tells whether this rank's NIC still
+// holds writes. Compiled out otherwise, since the inlined flush changes the register allocation of the kernels.
+__device__ __forceinline__ void report_gin_queue(const ncclGin& gin,
+                                                 const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
+    if constexpr (kReportGinQueue) {
+        const auto mask = __activemask();
+        if (threadIdx.x % 32 == __ffs(mask) - 1) {
+            const bool drained = gin.flush(ncclCoopThread(), cuda::memory_order_acquire, ncclGin_None{},
+                                           static_cast<uint64_t>(kNumOneSecCycles / 10)) == ncclSuccess;
+            printf("DeepEP GIN queue state, scale-out: %d, scale-up: %d, sm: %d, thread: %d, ctx: %d, NIC drained: %d\n",
+                   scaleout_rank_idx, scaleup_rank_idx, static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x),
+                   static_cast<int>(gin.contextId), static_cast<int>(drained));
+        }
+        __syncwarp(mask);
     }
 }
 
@@ -259,6 +284,7 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
                 printf("DeepEP Gin barrier timeout, tag: %d, scaleout: %d, scaleup: %d, thread: %d, "
                        "slot: %d, target: %lu\n", kTag, scaleout_rank_idx, scaleup_rank_idx, thread_idx,
                        static_cast<int>(signal_idx), target);
+                report_gin_queue(gin, scaleout_rank_idx, scaleup_rank_idx);
                 // Wait another 1 second to let all threads print information and
                 // trap similar to timeout_while
                 const auto stop = clock64() + kNumOneSecCycles;

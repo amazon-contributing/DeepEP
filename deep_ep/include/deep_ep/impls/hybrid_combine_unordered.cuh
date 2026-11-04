@@ -444,6 +444,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                            "channel: %d, forward warp: %d, dst: %d, head: %u, tail: %u, depth: %d\n",
                            scaleout_rank_idx, scaleup_rank_idx, channel_idx, forward_warp_idx,
                            dst, my_head, ring_tail, kProxyRingDepth);
+                    comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
                 }
                 return false;
             });
@@ -778,6 +779,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                            "channel: %d, signal: %lu, target: %lu\n",
                            scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
                            channel_idx, signal, target);
+                    comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
                 }
                 return false;
             });
