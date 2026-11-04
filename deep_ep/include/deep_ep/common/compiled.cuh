@@ -66,6 +66,10 @@ __device__ __forceinline__ longlong4_t make_longlong4_t(
 #define EP_NUM_TOPK_IDX_BITS 64
 #endif
 
+#ifndef EP_DEBUG_CHECKS
+#define EP_DEBUG_CHECKS 0
+#endif
+
 namespace deep_ep {
 
 #ifndef DISABLE_SM90_FEATURES
@@ -73,6 +77,18 @@ constexpr bool kEnableSM90Features = true;
 #else
 constexpr bool kEnableSM90Features = false;
 #endif
+
+// Debug checks compiled into the kernels. The host maps the names set in `EP_DEBUG_CHECKS` to these bits
+// (`get_debug_checks` in `csrc/utils/system.hpp`) and passes the mask to the JIT. The default build has none.
+constexpr int kDebugChecks = EP_DEBUG_CHECKS;
+constexpr int kDebugCheckGinQueue = 1 << 0;
+constexpr bool kReportGinQueue = (kDebugChecks & kDebugCheckGinQueue) != 0;
+
+struct DebugCheckName {
+    const char* name;
+    int bit;
+};
+constexpr DebugCheckName kDebugCheckNames[] = {{"queue", kDebugCheckGinQueue}};
 
 template <int kNumBits> struct int_with_bits;
 template <> struct int_with_bits<8>  { using type = int8_t;  };

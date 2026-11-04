@@ -5,10 +5,13 @@
 #include <filesystem>
 #include <functional>
 #include <random>
+#include <sstream>
 #include <string>
+#include <vector>
 #include <memory>
 #include <unistd.h>
 
+#include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
 
 #include "format.hpp"
@@ -32,6 +35,45 @@ static dtype_t get_env(const std::string& name, const dtype_t& default_value = d
     } else {
         EP_HOST_ASSERT(false and "Unexpected type");
     }
+}
+
+// `EP_DEBUG_CHECKS` becomes the bit mask the kernels are compiled with, in three steps.
+//   environment string  ->  check names   ->  one bit per name  ->  mask
+//   ""  or "0"               no names                              0
+//   "1" or "all"             every name in `kDebugCheckNames`      all bits
+//   "queue,nanny"            {"queue", "nanny"}                    kDebugCheckGinQueue | kDebugCheckNanny
+// An unknown name stops here, before any kernel is compiled.
+static std::vector<std::string> debug_check_names(const std::string& value) {
+    std::vector<std::string> names;
+    if (value.empty() or value == "0")
+        return names;
+    if (value == "1" or value == "all") {
+        for (const auto& check: kDebugCheckNames)
+            names.emplace_back(check.name);
+        return names;
+    }
+    std::stringstream list(value);
+    for (std::string name; std::getline(list, name, ',');)
+        names.push_back(name);
+    return names;
+}
+
+static int debug_check_bit(const std::string& name) {
+    for (const auto& check: kDebugCheckNames)
+        if (name == check.name)
+            return check.bit;
+    EP_HOST_UNREACHABLE(fmt::format("Unknown check in EP_DEBUG_CHECKS: {}", name));
+}
+
+static int debug_check_mask(const std::vector<std::string>& names) {
+    int mask = 0;
+    for (const auto& name: names)
+        mask |= debug_check_bit(name);
+    return mask;
+}
+
+static int get_debug_checks() {
+    return debug_check_mask(debug_check_names(get_env<std::string>("EP_DEBUG_CHECKS")));
 }
 
 static std::tuple<int, std::string> call_external_command(std::string command) {
