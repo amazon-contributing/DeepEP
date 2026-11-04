@@ -406,6 +406,7 @@ hybrid_unordered_dispatch_impl(
                                    is_expert_reduction ? "expert" : "rank",
                                    scaleout_rank_idx, scaleup_rank_idx, thread_idx, j,
                                    decoded);
+                            comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
                         }
                         return false;
                     });
@@ -930,16 +931,19 @@ hybrid_unordered_dispatch_impl(
                 __syncwarp();
 
                 // Timeout
-                if (is_last_check and lane_idx < kNumScaleoutRanks)
-                    printf("DeepEP hybrid dispatch (forwarding) timeout, scale-out: %d, scale-up: %d, "
-                           "channel: %d, lane: %d, old scale-out tail: %d, scale-out tail: (%d, %d), "
-                           "arrival anomaly: %d, part: %d, num valid: %d, "
-                           "completion missing: %d, missing part: %d, valid headers: %d, completions: %d\n",
-                           scaleout_rank_idx, scaleup_rank_idx,
-                           channel_idx, lane_idx, stored_scaleout_old_tail_idx,
-                           stored_finish_flag, stored_scaleout_tail_idx,
-                           static_cast<int>(anomaly_detected), anomaly_part, anomaly_num_valid,
-                           static_cast<int>(missing_part >= 0), missing_part, missing_num_valid, missing_landed);
+                if (is_last_check) {
+                    if (lane_idx < kNumScaleoutRanks)
+                        printf("DeepEP hybrid dispatch (forwarding) timeout, scale-out: %d, scale-up: %d, "
+                               "channel: %d, lane: %d, old scale-out tail: %d, scale-out tail: (%d, %d), "
+                               "arrival anomaly: %d, part: %d, num valid: %d, "
+                               "completion missing: %d, missing part: %d, valid headers: %d, completions: %d\n",
+                               scaleout_rank_idx, scaleup_rank_idx,
+                               channel_idx, lane_idx, stored_scaleout_old_tail_idx,
+                               stored_finish_flag, stored_scaleout_tail_idx,
+                               static_cast<int>(anomaly_detected), anomaly_part, anomaly_num_valid,
+                               static_cast<int>(missing_part >= 0), missing_part, missing_num_valid, missing_landed);
+                    comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
+                }
                 return false;
             });
 
@@ -1114,10 +1118,12 @@ hybrid_unordered_dispatch_impl(
                         comm::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]);
                     if (landed >= static_cast<int64_t>(expected_k))
                         return true;
-                    if (is_last_check)
+                    if (is_last_check) {
                         printf("DeepEP hybrid dispatch (epilogue shadow drain) timeout, "
                                "channel: %d, part: %d, landed: %lld, expected: %d\n",
                                channel_idx, k, (long long)landed, expected_k);
+                        comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
+                    }
                     return false;
                 });
                 gin.gin.increaseSignalShadow(part_signal_id(k), static_cast<uint64_t>(expected_k));
