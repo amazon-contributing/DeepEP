@@ -239,7 +239,8 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
     // Flush all QPs by all SMs (only needed for release semantics)
     if constexpr (kFlushStores) {
         for (int i = global_warp_idx; i < num_qps; i += kNumSMs * kNumWarps) {
-            ncclGin(nccl_dev_comm, i, NCCL_GIN_RESOURCE_SHARING_CTA).flush(ncclCoopWarp());
+            flush_with_timeout<kNumTimeoutCycles>(ncclGin(nccl_dev_comm, i, NCCL_GIN_RESOURCE_SHARING_CTA),
+                                                  ncclCoopWarp());
         }
 
         // World-team barriers may mix direct NVLink writes with GIN signals, so a system-scope
