@@ -35,6 +35,17 @@ struct WorkspaceLayout {
 
     static constexpr int64_t kNumBarrierSignalBytes = 16;
 
+    // Rail barrier flag storage. One slot per (tag, phase, peer). Tags come from the
+    // `k*Tag*` constants in `comm.cuh` and every instantiation of the rail barrier checks
+    // its tag against this bound; phases alternate so that only one write per slot is
+    // ever in flight (see the ordering argument at the rail branch of
+    // `gin_barrier_wo_local_sync`). The flags and the round counters behind them are
+    // monotonic for the life of the buffer: they are zeroed once at construction and must
+    // never be reset, because a rank whose counters restart while its peers' flags do not
+    // either passes a barrier without waiting or waits forever.
+    static constexpr int kNumBarrierTags = 16;
+    static constexpr int kNumBarrierPhases = 2;
+
     __forceinline__ __device__ __host__
     WorkspaceLayout(void* workspace,
                     const int& num_scaleout_ranks,
@@ -87,6 +98,12 @@ struct WorkspaceLayout {
 
         // AGRS signals
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
+
+        // Rail barrier iteration flags, written by peers
+        num_bytes += kNumBarrierTags * kNumBarrierPhases * kNumMaxRanks * sizeof(uint32_t);
+
+        // Rail barrier local round counters, never written by a peer
+        num_bytes += 2 * kNumBarrierTags * kNumMaxRanks * sizeof(uint32_t);
 
         return num_bytes;
     }
@@ -185,6 +202,33 @@ struct WorkspaceLayout {
         const auto base_ptr = math::advance_ptr<int>(
             get_agrs_recv_signal_ptr(0, 0), kNumMaxInflightAGRS * kNumMaxRanks * sizeof(int));
         return base_ptr + rank_idx;
+    }
+
+    // Rail barrier flag written by a peer. Monotonic across rounds: zeroed once at
+    // construction and never reset, which is a carve-out from the keep-workspace-zero
+    // rule in `buffer.hpp`.
+    __forceinline__ __device__ __host__ uint32_t* get_rail_barrier_flag_ptr(
+        const int& tag, const int& phase, const int& slot_idx) const {
+        const auto base_ptr = math::advance_ptr<uint32_t>(
+            get_agrs_session_signal_ptr(0), kNumMaxRanks * sizeof(int));
+        return base_ptr + ((tag * kNumBarrierPhases + phase) * kNumMaxRanks + slot_idx);
+    }
+
+    // Local round counters for the rail barrier, one pair per (tag, index). Never written
+    // by a peer, so these carry no ordering requirement. Same monotonic carve-out.
+    __forceinline__ __device__ __host__ uint32_t* get_rail_barrier_send_seq_ptr(
+        const int& tag, const int& peer_idx) const {
+        const auto base_ptr = math::advance_ptr<uint32_t>(
+            get_rail_barrier_flag_ptr(0, 0, 0),
+            kNumBarrierTags * kNumBarrierPhases * kNumMaxRanks * sizeof(uint32_t));
+        return base_ptr + (tag * kNumMaxRanks + peer_idx);
+    }
+
+    __forceinline__ __device__ __host__ uint32_t* get_rail_barrier_recv_seq_ptr(
+        const int& tag, const int& slot_idx) const {
+        const auto base_ptr = math::advance_ptr<uint32_t>(
+            get_rail_barrier_send_seq_ptr(0, 0), kNumBarrierTags * kNumMaxRanks * sizeof(uint32_t));
+        return base_ptr + (tag * kNumMaxRanks + slot_idx);
     }
 };
 
