@@ -319,6 +319,7 @@ public:
         int num_hidden_bytes, num_sf_packs;
         int num_max_tokens_per_rank;
         int num_experts, num_topk, expert_alignment;
+        int debug_checks;
 
         // Parameters
         void *buffer, *workspace;
@@ -343,7 +344,7 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",
                            args.do_expand, args.cached_mode, args.do_zero_padding,
@@ -351,7 +352,8 @@ static void __instantiate_kernel() {{
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
                            args.num_hidden_bytes, args.num_sf_packs,
                            args.num_max_tokens_per_rank,
-                           args.num_experts, args.num_topk, args.expert_alignment);
+                           args.num_experts, args.num_topk, args.expert_alignment,
+                           args.debug_checks);
     }
 
     static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
@@ -401,6 +403,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
         .num_hidden_bytes = num_hidden_bytes, .num_sf_packs = num_sf_packs,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .num_experts = num_experts, .num_topk = num_topk, .expert_alignment = expert_alignment,
+        .debug_checks = get_debug_check_mask(),
         .buffer = buffer, .workspace = workspace,
         .psum_num_recv_tokens_per_scaleup_rank = psum_num_recv_tokens_per_scaleup_rank,
         .psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert,

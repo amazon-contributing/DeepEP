@@ -263,6 +263,7 @@ public:
         int num_max_tokens_per_rank;
         int num_experts, num_topk;
         int num_channels;
+        int debug_checks;
 
         // Parameters
         nv_bfloat16* combined_x;
@@ -285,7 +286,7 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",                        args.use_expanded_layout, args.allow_multiple_reduction,
                            args.launch_args.grid_dim.first,
@@ -295,6 +296,7 @@ static void __instantiate_kernel() {{
                            args.num_max_tokens_per_rank,
                            args.num_experts, args.num_topk,
                            args.num_channels,
+                           args.debug_checks,
                            args.use_ordered_kernel);
     }
 
@@ -342,6 +344,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .num_experts = num_experts, .num_topk = num_topk,
         .num_channels = num_channels,
+        .debug_checks = get_debug_check_mask(),
         .combined_x = static_cast<nv_bfloat16*>(combined_x),
         .combined_topk_weights = combined_topk_weights,
         .combined_topk_idx = combined_topk_idx,

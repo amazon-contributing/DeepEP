@@ -51,4 +51,11 @@ static bool use_ordered_hybrid_kernel() {
     return ordered;
 }
 
+// The mask of `EP_DEBUG_CHECKS` (see `deep_ep/common/compiled.cuh`), read once per process. The JIT
+// generators pass it to the kernels as the template argument `kDebugChecks`
+static int get_debug_check_mask() {
+    static const int mask = get_debug_checks();
+    return mask;
+}
+
 } // namespace deep_ep::elastic
