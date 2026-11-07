@@ -194,6 +194,11 @@ public:
         return {nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks};
     }
 
+    // The `nanny` check of `EP_DEBUG_CHECKS` keeps the last words of the dynamic shared memory for itself
+    static int get_nanny_smem_bytes() {
+        return (get_debug_checks() & kDebugCheckNanny) != 0 ? kNumNannySmemBytes : 0;
+    }
+
     // ReSharper disable once CppMemberFunctionMayBeStatic
     void barrier(const bool& use_comm_stream, const bool& with_cpu_sync, const bool& sequential = true) const {
         const auto compute_stream = at::cuda::getCurrentCUDAStream();
@@ -895,15 +900,16 @@ public:
         // Only for hybrid version
         int num_channels_per_sm = 1, num_channels = 1;
         const int num_smem_bytes = jit::device_runtime->get_num_smem_bytes();
+        const int num_pool_smem_bytes = num_smem_bytes - get_nanny_smem_bytes();
         if (nccl_context->num_scaleout_ranks > 1) {
             const auto dispatch_token_layout = get_dispatch_token_layout(hidden, x.element_size(), num_sf_packs, num_topk);
             const auto combine_token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
             EP_HOST_ASSERT(num_sms <= kNumMaxSMs);
             num_channels_per_sm = std::min<int>(
-                (num_smem_bytes - get_num_notify_smem_bytes(nccl_context->num_ranks, num_experts)) / dispatch_token_layout.get_num_bytes<true>(),
+                (num_pool_smem_bytes - get_num_notify_smem_bytes(nccl_context->num_ranks, num_experts)) / dispatch_token_layout.get_num_bytes<true>(),
                 32 - kNumNotifyWarps);
             num_channels_per_sm = std::min<int>(
-                num_smem_bytes / combine_token_layout.get_num_bytes<true>(),
+                num_pool_smem_bytes / combine_token_layout.get_num_bytes<true>(),
                 num_channels_per_sm);
             if (elastic::use_ordered_hybrid_kernel()) {
                 // The ordered kernel carves one send + one forward TMA buffer per channel and has
@@ -924,7 +930,7 @@ public:
             EP_HOST_ASSERT(static_cast<int64_t>(dispatch_buffers_per_channel) * num_channels_per_sm *
                                    dispatch_token_layout.get_num_bytes<true>() +
                                get_num_notify_smem_bytes(nccl_context->num_ranks, num_experts) <=
-                           num_smem_bytes and
+                           num_pool_smem_bytes and
                            "dispatch TMA pool exceeds the shared-memory budget");
             if (not prefer_overlap_with_compute)
                 num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
@@ -948,7 +954,7 @@ public:
                            combine_token_layout.get_num_bytes<true, int64_t>() +
                        elastic::ProxyRingLayout::get_num_bytes(num_channels_per_sm,
                                                                elastic::kProxyRingDepthDefault) >
-                   num_smem_bytes)
+                   num_pool_smem_bytes)
                 -- num_channels_per_sm;
             EP_HOST_ASSERT(num_channels_per_sm >= 1 and
                            "shared memory cannot host a single dispatch channel at this token size");

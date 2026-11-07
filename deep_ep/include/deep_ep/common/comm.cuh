@@ -114,6 +114,109 @@ __device__ __forceinline__ void report_gin_queue(const ncclGin& gin,
     }
 }
 
+// With the `nanny` check on, an idle lane of the warp watches the lanes that post, since `ncclGin::put` has no
+// timeout. The words live in the last `kNumNannySmemBytes` of the dynamic shared memory, outside the TMA pool.
+__device__ __forceinline__ unsigned* nanny_words() {
+    extern __shared__ __align__(16) int8_t nanny_smem[];
+    uint32_t num_smem_bytes;
+    asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(num_smem_bytes));
+    return reinterpret_cast<unsigned*>(nanny_smem + (num_smem_bytes - kNumNannySmemBytes));
+}
+
+// For a converged warp. The posting lanes run `post`, and the lowest idle lane waits for them in `timeout_while`
+// and prints the lanes that did not return. One word per warp.
+template <int64_t kNumTimeoutCycles, typename post_t>
+__device__ __forceinline__ void guarded_post(const bool& do_post, const post_t& post, const char* where,
+                                             const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
+    if constexpr (not kGuardGinPosts) {
+        if (do_post)
+            post();
+        return;
+    }
+    auto* returned = nanny_words() + threadIdx.x / 32;
+    const unsigned post_mask = __ballot_sync(0xffffffffu, do_post);
+    const int lane_idx = static_cast<int>(threadIdx.x) % 32, nanny_lane_idx = __ffs(~post_mask) - 1;
+    if (lane_idx == nanny_lane_idx)
+        *returned = 0;
+    __syncwarp();
+    if (do_post) {
+        post();
+        atomicOr_block(returned, 1u << lane_idx);
+    } else if (lane_idx == nanny_lane_idx and post_mask != 0) {
+        timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+            const auto returned_mask = *reinterpret_cast<volatile unsigned*>(returned);
+            if (returned_mask == post_mask)
+                return true;
+            if (is_last_check)
+                printf("DeepEP GIN post stuck (%s), scale-out: %d, scale-up: %d, sm: %d, warp: %d, stuck lanes: 0x%08x\n",
+                       where, scaleout_rank_idx, scaleup_rank_idx, static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x / 32),
+                       post_mask & ~returned_mask);
+            return false;
+        });
+    }
+    __syncwarp();
+}
+
+// For a warp whose lanes post on their own schedule (the combine proxy). Each posting lane stamps the clock into its
+// word for the duration of its put, and the lowest idle lane watches the stamps until every posting lane has called
+// `nanny_done`. One word per lane, the watcher's own word holds the done mask.
+static constexpr int kNannyStampShift = 11;
+
+__device__ __forceinline__ unsigned nanny_stamp() {
+    return static_cast<unsigned>(clock64() >> kNannyStampShift) | 1u;
+}
+
+__device__ __forceinline__ void nanny_init() {
+    if constexpr (kGuardGinPosts) {
+        nanny_words()[threadIdx.x % 32] = 0;
+        __syncwarp();
+    }
+}
+
+__device__ __forceinline__ void nanny_post_begin() {
+    if constexpr (kGuardGinPosts)
+        reinterpret_cast<volatile unsigned*>(nanny_words())[threadIdx.x % 32] = nanny_stamp();
+}
+
+__device__ __forceinline__ void nanny_post_end() {
+    if constexpr (kGuardGinPosts)
+        reinterpret_cast<volatile unsigned*>(nanny_words())[threadIdx.x % 32] = 0;
+}
+
+__device__ __forceinline__ void nanny_done(const unsigned& poster_mask) {
+    if constexpr (kGuardGinPosts)
+        atomicOr_block(nanny_words() + (__ffs(~poster_mask) - 1), 1u << (threadIdx.x % 32));
+}
+
+template <int64_t kNumTimeoutCycles>
+__device__ __forceinline__ void watch_posts(const unsigned& poster_mask, const char* where,
+                                            const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
+    if constexpr (kGuardGinPosts) {
+        const int lane_idx = static_cast<int>(threadIdx.x) % 32, nanny_lane_idx = __ffs(~poster_mask) - 1;
+        if (poster_mask == 0xffffffffu or lane_idx != nanny_lane_idx)
+            return;
+        auto* words = reinterpret_cast<volatile unsigned*>(nanny_words());
+        while ((words[nanny_lane_idx] & poster_mask) != poster_mask) {
+            const auto now = nanny_stamp();
+            unsigned stuck = 0;
+            for (int lane = 0; lane < 32; ++ lane) {
+                const auto stamp = ((poster_mask >> lane) & 1) ? words[lane] : 0;
+                if (stamp != 0 and (static_cast<int64_t>(now - stamp) << kNannyStampShift) > kNumTimeoutCycles)
+                    stuck |= 1u << lane;
+            }
+            if (stuck != 0) {
+                printf("DeepEP GIN post stuck (%s), scale-out: %d, scale-up: %d, sm: %d, warp: %d, stuck lanes: 0x%08x\n",
+                       where, scaleout_rank_idx, scaleup_rank_idx, static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x / 32),
+                       stuck);
+                const auto stop = clock64() + kNumOneSecCycles;
+                while (clock64() < stop) {}
+                ptx::trap();
+            }
+            __nanosleep(1000);
+        }
+    }
+}
+
 // Channels map onto QPs with a BALANCED CONTIGUOUS (block) partition: fill a QP with
 // consecutive channels before spilling to the next (so an SM's channels stay grouped
 // on the same GIN context), and when the channels do not divide the QPs evenly,

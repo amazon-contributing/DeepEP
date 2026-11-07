@@ -82,13 +82,16 @@ constexpr bool kEnableSM90Features = false;
 // (`get_debug_checks` in `csrc/utils/system.hpp`) and passes the mask to the JIT. The default build has none.
 constexpr int kDebugChecks = EP_DEBUG_CHECKS;
 constexpr int kDebugCheckGinQueue = 1 << 0;
+constexpr int kDebugCheckNanny = 1 << 1;
 constexpr bool kReportGinQueue = (kDebugChecks & kDebugCheckGinQueue) != 0;
+constexpr bool kGuardGinPosts = (kDebugChecks & kDebugCheckNanny) != 0;
 
 struct DebugCheckName {
     const char* name;
     int bit;
 };
-constexpr DebugCheckName kDebugCheckNames[] = {{"queue", kDebugCheckGinQueue}};
+constexpr DebugCheckName kDebugCheckNames[] = {{"queue", kDebugCheckGinQueue},
+                                               {"nanny", kDebugCheckNanny}};
 
 template <int kNumBits> struct int_with_bits;
 template <> struct int_with_bits<8>  { using type = int8_t;  };
@@ -117,5 +120,9 @@ constexpr int kGinQPFlushDepth = 768;
 constexpr int kNumDispatchSendBuffers = 1;
 constexpr int kNumDispatchFwdBuffers = 2;
 constexpr int kNumDispatchBuffersPerChannel = kNumDispatchSendBuffers + kNumDispatchFwdBuffers;
+
+// Words of the `nanny` check at the end of the dynamic shared memory, one per warp for `comm::guarded_post`
+// (dispatch) or one per lane of the proxy warp for `comm::nanny_post_begin` (combine)
+constexpr int kNumNannySmemBytes = 32 * sizeof(unsigned);
 
 } // namespace deep_ep
