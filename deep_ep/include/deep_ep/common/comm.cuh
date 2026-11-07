@@ -97,6 +97,14 @@ __device__ __forceinline__ void flush_with_timeout(const gin_t& gin, const coop_
     }
 }
 
+// Flush the Gin contexts [0, num_contexts), one warp per context, spread over `kNumWorkers` warps
+template <int kNumWorkers, int64_t kNumTimeoutCycles>
+__device__ __forceinline__ void flush_gin_contexts(const ncclDevComm_t& nccl_dev_comm,
+                                                   const int& num_contexts, const int& worker_idx) {
+    for (int i = worker_idx; i < num_contexts; i += kNumWorkers)
+        flush_with_timeout<kNumTimeoutCycles>(ncclGin(nccl_dev_comm, i), ncclCoopWarp());
+}
+
 // With the `queue` check on, a timed flush after a network-wait timeout tells whether this rank's NIC still
 // holds writes. Compiled out otherwise, since the inlined flush changes the register allocation of the kernels.
 __device__ __forceinline__ void report_gin_queue(const ncclGin& gin,
@@ -238,10 +246,7 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
 
     // Flush all QPs by all SMs (only needed for release semantics)
     if constexpr (kFlushStores) {
-        for (int i = global_warp_idx; i < num_qps; i += kNumSMs * kNumWarps) {
-            flush_with_timeout<kNumTimeoutCycles>(ncclGin(nccl_dev_comm, i, NCCL_GIN_RESOURCE_SHARING_CTA),
-                                                  ncclCoopWarp());
-        }
+        flush_gin_contexts<kNumSMs * kNumWarps, kNumTimeoutCycles>(nccl_dev_comm, num_qps, global_warp_idx);
 
         // World-team barriers may mix direct NVLink writes with GIN signals, so a system-scope
         // threadfence is required to make the NVLink writes visible before publishing the barrier
