@@ -80,11 +80,15 @@ public:
     // NCCL handles
     ncclComm_t comm;
     jit::NoRefPtr dev_comm;
+    // GIN device communicator for PP and Engram: `dev_comm` itself when that carries GIN
+    jit::NoRefPtr gin_dev_comm;
     ncclWindow_t window;
     void* mapped_window_ptr;
     std::vector<void*> nvl_window_ptrs;
 
     // Configs
+    bool allow_hybrid_mode;
+    int sl_idx;
     int num_allocated_qps;
     elastic::gin_alloc::GinResourceConfig gin_config;
 
@@ -102,6 +106,9 @@ public:
     // ~NCCLSymmetricMemoryContext();
 
     void* get_sym_ptr(void* ptr, const int& dst_rank_idx) const;
+
+    // Collective, as `ncclDevCommCreate` is; does nothing if `out` already exists
+    void create_dev_comm(jit::NoRefPtr& out, const bool& with_gin);
 
     void finalize();
 };
