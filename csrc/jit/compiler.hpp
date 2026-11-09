@@ -81,6 +81,15 @@ public:
         // TODO: make it more general, e.g. `EP_JIT_EXTRA_FLAGS`
         if (int num_topk_idx_bits = get_env("EP_NUM_TOPK_IDX_BITS", 0); num_topk_idx_bits != 0)
             flags += fmt::format(" -DEP_NUM_TOPK_IDX_BITS={}", num_topk_idx_bits);
+
+        // Different configurations have different compute power, so combine's
+        // batching is adjusted accordingly: sweeps found 12 on SM90 (flat from 6 up),
+        // 6 on SM100 (the only interior optimum) and 12 on SM103.
+        const auto [arch_major, arch_minor] = device_runtime->get_arch_pair();
+        int combine_batch_size = 12;
+        if (arch_major == 10 and arch_minor == 0)
+            combine_batch_size = 6;
+        flags += fmt::format(" -DEP_COMBINE_BATCH_SIZE={}", combine_batch_size);
     }
 
     virtual ~Compiler() = default;
