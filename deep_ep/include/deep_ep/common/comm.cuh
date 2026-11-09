@@ -22,6 +22,18 @@
 
 namespace deep_ep::elastic::comm {
 
+// NCCL_VERSION_CODE of the NCCL the kernel runs on: the JIT passes it from `ncclGetVersion()`
+// (csrc/jit/compiler.hpp); a compile without the JIT falls back to the header's own version.
+#ifndef EP_NCCL_RUNTIME_VERSION
+#define EP_NCCL_RUNTIME_VERSION NCCL_VERSION_CODE
+#endif
+
+// Thread-exclusive GIN handles (NCCL_GIN_RESOURCE_SHARING_THREAD) need the thread-exclusive Put of
+// NVIDIA/nccl ad35c997, first released in 2.32.6. An older NCCL runs a THREAD handle down the
+// GPU-shared path, which is slower than CTA on a QP one SM owns, so such a handle keeps the mapped
+// mode there.
+inline constexpr bool kNcclHasThreadPut = EP_NCCL_RUNTIME_VERSION >= NCCL_VERSION(2, 32, 6);
+
 static constexpr int64_t kNumOneSecCycles = 2000000000;  // An approximation of the GPU clock at 2000 MHz
 
 // Some reserved tags
