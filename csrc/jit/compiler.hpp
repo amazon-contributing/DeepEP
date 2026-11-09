@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <nccl.h>
 #include <nvrtc.h>
 #include <optional>
 #include <regex>
@@ -67,6 +68,14 @@ public:
         if (const auto debug_checks = get_debug_checks(); debug_checks != 0)
             flags += fmt::format(" -DEP_DEBUG_CHECKS={}", debug_checks);
         flags += fmt::format(" -I {}/include", nccl_root.c_str());
+
+        // The NCCL the kernels run on, from the loaded library (`check_nccl_so` ties the JIT headers under
+        // `nccl_root` to it). Device code gates paths that need a newer NCCL on this value, e.g. the
+        // thread-exclusive GIN handle of the combine proxy (`comm::kNcclHasThreadPut`). Part of the flags,
+        // so the JIT cache keeps one cubin per NCCL version.
+        int nccl_runtime_version = 0;
+        NCCL_CHECK(ncclGetVersion(&nccl_runtime_version));
+        flags += fmt::format(" -DEP_NCCL_RUNTIME_VERSION={}", nccl_runtime_version);
 
         // Some special flags for EP
         // TODO: make it more general, e.g. `EP_JIT_EXTRA_FLAGS`
