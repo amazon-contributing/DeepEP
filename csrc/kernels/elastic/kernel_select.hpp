@@ -19,36 +19,24 @@
 
 namespace deep_ep::elastic {
 
-// `EP_HYBRID_KERNEL` selects the hybrid (scale-out) dispatch/combine kernel pair at
-// JIT-generation time:
-//
-//   "unordered" (default) — per-part batched puts with in-band token headers and
-//                           counting signals. Makes no assumption about network
-//                           delivery order, so strong signal is not required, and
-//                           weak signal is enough.
-//
-//   "ordered"             — the upstream kernels: the sender publishes a tail via a
-//                           trailing signal and the receiver assumes all data
-//                           preceding the tail has landed. Requires the backend to
-//                           support strong signals and VA signals.
-//
-// The value is read once per process. It changes the JIT-generated source (header and
-// kernel names differ), so the JIT cache distinguishes the two variants automatically.
-static bool use_ordered_hybrid_kernel() {
-    static const bool ordered = [] {
+// `EP_HYBRID_KERNEL` selects the hybrid (scale-out) kernels: "ordered" (default) assumes in-order
+// delivery and uses GIN strong signals, "unordered" does not and uses GIN weak signals
+inline bool use_unordered_hybrid_kernel() {
+    static const bool unordered = [] {
         const auto value = get_env<std::string>("EP_HYBRID_KERNEL");
         bool result = false;
-        if (value.empty() or value == "unordered") {
+        if (value.empty() or value == "ordered") {
             result = false;
-        } else if (value == "ordered") {
+        } else if (value == "unordered") {
             result = true;
         } else {
             EP_HOST_ASSERT(false and "EP_HYBRID_KERNEL must be `ordered` or `unordered`");
         }
-        printf("DeepEP hybrid kernel selection: %s\n", result ? "ordered" : "unordered");
+        if (get_env<int>("EP_BUFFER_DEBUG"))
+            printf("DeepEP hybrid kernel selection: %s\n", result ? "unordered" : "ordered");
         return result;
     }();
-    return ordered;
+    return unordered;
 }
 
 } // namespace deep_ep::elastic

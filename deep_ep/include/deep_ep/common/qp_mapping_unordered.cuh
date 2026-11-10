@@ -11,9 +11,8 @@
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 // Pure-integer channel<->QP mapping math shared by `get_qp_mode` and
-// `get_qp_signal_id` in `comm.cuh`. Kept free of CUDA/NCCL types so the exact
-// shipped logic also compiles as plain host C++ for the unit test in
-// `tests/cpp/test_qp_mapping.cpp`.
+// `get_qp_signal_id` in `comm_unordered.cuh`. Kept free of CUDA/NCCL types so it
+// also compiles as plain host C++.
 
 #if defined(__CUDACC__)
 #define QP_MAPPING_HD __host__ __device__ __forceinline__
@@ -36,13 +35,10 @@ struct QPSlot {
 // The first `n % q` bins own `ceil(n/q)` items; the remaining bins own
 // `floor(n/q)`. Items are assigned in monotonic, contiguous blocks (item 0 ->
 // bin 0, ...), so a producer's consecutive items stay grouped on one/adjacent
-// bin. Properties (all asserted in the unit test):
+// bin. Properties:
 //   * Balanced:   any two bins differ in size by <= 1.
 //   * No idle bin when q <= n: every bin index in [0, q) owns >= 1 item.
 //   * Contiguous & monotonic: bin index is non-decreasing in `idx`.
-//   * Backward-compatible: when `n % q == 0` the split is 0, every item takes
-//     the `else` path, and `bin == idx / (n/q)` -- byte-identical to the old
-//     ceil-block mapping for even divisions (all shipped power-of-2 configs).
 //
 // Callers guarantee `q >= 1`. `base == 0` (i.e. `q > n`) is safe: then
 // `rem == n`, `split == n`, and every valid `idx` in [0, n) takes the `if`
@@ -58,7 +54,7 @@ QP_MAPPING_HD constexpr QPSlot balanced_partition(int idx, int n, int q) {
 }
 
 // QP index for a data/notify channel. Mirrors `get_qp_mode` (minus the NCCL
-// resource-sharing mode, which stays in `comm.cuh`).
+// resource-sharing mode, which stays in `comm_unordered.cuh`).
 template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, bool kWithNotifyWarps>
 QP_MAPPING_HD constexpr int channel_to_qp(int sm_idx, int channel_in_sm_idx,
                                           bool is_notify_warp = false) {

@@ -1,0 +1,294 @@
+#pragma once
+
+// MIT License
+//
+// Copyright (c) 2025 DeepSeek
+// Changes and additions copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+#include <cooperative_groups.h>
+#include <nccl.h>
+#include <nccl_device.h>
+
+#include <deep_ep/common/comm.cuh>
+#include <deep_ep/common/qp_mapping_unordered.cuh>
+
+// Channel-to-QP mapping and GIN barrier for the unordered hybrid kernels
+namespace deep_ep::elastic::comm::unordered {
+
+// A signal can be backed by a counter this many bits wide, so it wraps while the shadow it is
+// compared against keeps counting. Conservative: it must not exceed the narrowest counter any
+// backend uses, and must stay above the largest delta a wait can have outstanding.
+static constexpr int kNumSignalBits = 31;
+
+// Difference between a signal and a shadow. An absolute `signal - base` is wrong from the first
+// wrap on, so take it modulo the counter's range and fold the result into the signed half of
+// that range instead.
+__device__ __forceinline__ int64_t signal_delta(const uint64_t& signal, const uint64_t& base) {
+    constexpr int64_t kRange = int64_t{1} << kNumSignalBits;
+    const int64_t diff = static_cast<int64_t>((signal - base) & (kRange - 1));
+    return diff < kRange / 2 ? diff : diff - kRange;
+}
+
+template <int64_t kNumTimeoutCycles, typename gin_t, typename coop_t>
+__device__ __forceinline__ void flush_with_timeout(const gin_t& gin, const coop_t& coop) {
+    if (gin.flush(coop, cuda::memory_order_acquire, ncclGin_None{},
+                  static_cast<uint64_t>(kNumTimeoutCycles)) != ncclSuccess) {
+        if constexpr (kReportGinQueue) {
+            // Name the context and give the other warps' timeout reports a second to print before the trap
+            printf("DeepEP Gin flush timeout, sm: %d, thread: %d, ctx: %d\n",
+                   static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x), static_cast<int>(gin.contextId));
+            const auto stop = clock64() + kNumOneSecCycles;
+            while (clock64() < stop) {}
+        } else {
+            printf("DeepEP Gin flush timeout, sm: %d, thread: %d\n",
+                   static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x));
+        }
+        ptx::trap();
+    }
+}
+
+// With the `queue` check on, a timed flush after a network-wait timeout tells whether this rank's NIC still
+// holds writes. Compiled out otherwise, since the inlined flush changes the register allocation of the kernels.
+__device__ __forceinline__ void report_gin_queue(const ncclGin& gin,
+                                                 const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
+    if constexpr (kReportGinQueue) {
+        const auto mask = __activemask();
+        if (threadIdx.x % 32 == __ffs(mask) - 1) {
+            const bool drained = gin.flush(ncclCoopThread(), cuda::memory_order_acquire, ncclGin_None{},
+                                           static_cast<uint64_t>(kNumOneSecCycles / 10)) == ncclSuccess;
+            printf("DeepEP GIN queue state, scale-out: %d, scale-up: %d, sm: %d, thread: %d, ctx: %d, NIC drained: %d\n",
+                   scaleout_rank_idx, scaleup_rank_idx, static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x),
+                   static_cast<int>(gin.contextId), static_cast<int>(drained));
+        }
+        __syncwarp(mask);
+    }
+}
+
+// Channels map onto QPs with a BALANCED CONTIGUOUS (block) partition: fill a QP with
+// consecutive channels before spilling to the next (so an SM's channels stay grouped
+// on the same GIN context), and when the channels do not divide the QPs evenly,
+// spread the remainder one-per-QP across the leading QPs instead of leaving a
+// trailing QP idle. The integer partition lives in `qp_mapping_unordered.cuh` (host-testable);
+// this wrapper only adds the NCCL resource-sharing mode.
+//   e.g. 48 channels / 4 QPs  -> {12,12,12,12}
+//        4  channels / 3 QPs  -> QP0<-2, QP1<-1, QP2<-1
+template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, bool kWithNotifyWarps = false>
+__device__ __forceinline__ std::pair<int, ncclGinResourceSharingMode> get_qp_mode(
+    const int& sm_idx, const int& channel_in_sm_idx, const bool& is_notify_warp = false) {
+    static_assert(kNumQPs >= 1,
+                  "kNumQPs must be >= 1. With 0 the kNumQPs == 1 fast path is skipped, "
+                  "kNumSMs <= kNumAvailableQPs is false, and balanced_partition() is called "
+                  "with q == 0, i.e. n / 0. Compiled for the host this specialization exits on "
+                  "SIGFPE; in a GPU run it produced corrupted output and no reported fault.");
+
+    constexpr auto kSharingCTA = NCCL_GIN_RESOURCE_SHARING_CTA;
+    constexpr auto kSharingGrid = kNumSMs == 1 ? NCCL_GIN_RESOURCE_SHARING_CTA : NCCL_GIN_RESOURCE_SHARING_GPU;
+
+    // Only one QP
+    if constexpr (kNumQPs == 1)
+        return {0, kSharingGrid};
+
+    // The notify warp always use 1 SM and 1 QP
+    if (is_notify_warp)
+        return {0, kSharingCTA};
+
+    // Data channels: QP index from the shared balanced partition, sharing mode from
+    // the branch (CTA when SMs each own their QPs, GPU-wide when SMs share QPs).
+    constexpr int kNumAvailableQPs = kNumQPs - static_cast<int>(kWithNotifyWarps);
+    const int qp_idx = channel_to_qp<kNumSMs, kNumQPs, kNumChannelsPerSM, kWithNotifyWarps>(
+        sm_idx, channel_in_sm_idx, is_notify_warp);
+    if constexpr (kNumSMs <= kNumAvailableQPs)
+        return {qp_idx, kSharingCTA};
+    else
+        return {qp_idx, kSharingGrid};
+}
+
+// Companion to `get_qp_mode`: within a QP, gives a unique per-channel signal id
+// (position of this channel among all channels sharing the same QP). Uses the same
+// BALANCED CONTIGUOUS partition as `get_qp_mode` (see `qp_mapping_unordered.cuh`), so the id is
+// the channel's offset within its QP's block:
+//   kNumQPs == 1                : every channel on the single QP -> id = global_channel_idx
+//   kNumSMs <= kNumAvailableQPs : offset within the SM's balanced local-QP block
+//   kNumSMs  > kNumAvailableQPs : offset within the global balanced QP block
+// In all cases id < ceil(channels / qps), so `(qp, id)` is unique per channel and the
+// tuner's per-QP signal budget (sized for ceil(channels / qps)) is never exceeded.
+template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, bool kWithNotifyWarps = false>
+__device__ __forceinline__ int get_qp_signal_id(
+    const int& sm_idx, const int& channel_in_sm_idx) {
+    return channel_to_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, kWithNotifyWarps>(
+        sm_idx, channel_in_sm_idx);
+}
+
+// Per-part indexed-signal id: kNumParts contiguous ids under the channel's base id, one
+// per token part and shared by all sources. The tuner + channel cap guarantee
+// ceil(num_channels / qps) * kNumParts <= gin_indexed_signals_cnt.
+template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, int kNumParts,
+          bool kWithNotifyWarps = false>
+__device__ __forceinline__ int get_per_part_signal_id(
+    const int& sm_idx, const int& channel_in_sm_idx, const int& part_idx) {
+    return get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, kWithNotifyWarps>(
+               sm_idx, channel_in_sm_idx) * kNumParts + part_idx;
+}
+
+template <int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs, int64_t kNumTimeoutCycles,
+          typename team_t, int kTag = kDeviceBarrierTag,
+          bool kFlushStores = true,
+          int kNumWarps = kNumThreads / 32>
+__forceinline__ __device__ void gin_barrier_wo_local_sync(
+    const ncclDevComm_t& nccl_dev_comm,
+    const int& scaleout_rank_idx, const int& scaleup_rank_idx, 
+    const int& sm_idx, const int& thread_idx) {
+    const auto global_warp_idx = sm_idx * kNumWarps + (thread_idx / 32);
+    const int& rank_idx = (std::is_same_v<team_t, ncclTeamTagWorld>) ? scaleup_rank_idx : scaleout_rank_idx;
+    const int num_qps = kNumQPs == kFlushAllAllocatedQPs ? nccl_dev_comm.ginContextCount : kNumQPs;
+
+    // Flush all QPs by all SMs (only needed for release semantics)
+    if constexpr (kFlushStores) {
+        for (int i = global_warp_idx; i < num_qps; i += kNumSMs * kNumWarps) {
+            flush_with_timeout<kNumTimeoutCycles>(ncclGin(nccl_dev_comm, i, NCCL_GIN_RESOURCE_SHARING_CTA),
+                                                  ncclCoopWarp());
+        }
+
+        // World-team barriers may mix direct NVLink writes with GIN signals, so a system-scope
+        // threadfence is required to make the NVLink writes visible before publishing the barrier
+        if constexpr (std::is_same_v<team_t, ncclTeamTagWorld>)
+            ptx::fence_acq_rel_sys();
+
+        // NOTES: we can not use `kNumSMs` to judge, as maybe only part of the SMs will call this function
+        (gridDim.x > 1) ? cooperative_groups::this_grid().sync() : __syncthreads();
+    }
+
+    if (sm_idx == 0) {
+        // Use QP 0 to do barrier
+        const auto team = (std::is_same_v<team_t, ncclTeamTagWorld>) ?
+            ncclTeamWorld(nccl_dev_comm) : ncclTeamRail(nccl_dev_comm);
+        const ncclGin gin(nccl_dev_comm, 0, NCCL_GIN_RESOURCE_SHARING_CTA);
+
+        // Compact signal indexing: (kNumRanks - 1) signal slots per rank. Sender rank_idx
+        // writes to every peer i at the slot that identifies *itself* in the peer's
+        // enumeration:
+        //   sig = (rank_idx < i) ? rank_idx : (rank_idx - 1)
+        // So on receiver R, each of the (kNumRanks - 1) slots gets exactly +1 from a
+        // distinct sender, and the wait side just iterates all slots looking for one
+        // increment per slot.
+        for (int i = thread_idx; i < kNumRanks; i += kNumThreads) {
+            if (i == rank_idx) continue;
+            const auto sig = static_cast<ncclGinSignal_t>((rank_idx < i) ? rank_idx : (rank_idx - 1));
+            gin.signal(team, i, ncclGin_SignalInc{sig});
+        }
+
+        for (int i = thread_idx; i < kNumRanks - 1; i += kNumThreads) {
+            const auto signal_idx = static_cast<ncclGinSignal_t>(i);
+            const auto shadow_ptr = gin.getSignalShadowPtr(signal_idx);
+            const auto target = ++(*shadow_ptr);
+
+            // Wait through NCCL's own API: it compares within `kNumSignalBits` so the signal
+            // wrapping is handled and reports a timeout.
+            // The timeout overload needs NCCL >= 2.31.2
+            if (gin.waitSignal(ncclCoopThread(), signal_idx, target, kNumSignalBits,
+                               cuda::memory_order_acquire,
+                               static_cast<uint64_t>(kNumTimeoutCycles)) != ncclSuccess) {
+                printf("DeepEP Gin barrier timeout, tag: %d, scaleout: %d, scaleup: %d, thread: %d, "
+                       "slot: %d, target: %lu\n", kTag, scaleout_rank_idx, scaleup_rank_idx, thread_idx,
+                       static_cast<int>(signal_idx), target);
+                report_gin_queue(gin, scaleout_rank_idx, scaleup_rank_idx);
+                // Wait another 1 second to let all threads print information and
+                // trap similar to timeout_while
+                const auto stop = clock64() + kNumOneSecCycles;
+                while (clock64() < stop) {}
+                ptx::trap();
+            }
+        }
+    }
+}
+
+template <bool kIsScaleupNVLink, int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs,
+          int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag, bool kFlushStores = true>
+__forceinline__ __device__ void scaleup_barrier_wo_local_sync(
+    const handle::NCCLGin& gin,
+    const layout::WorkspaceLayout& workspace,
+    const int& rank_idx, const int& sm_idx, const int& thread_idx) {
+    if constexpr (kIsScaleupNVLink) {
+        nvlink_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumTimeoutCycles, kTag>(
+            gin, workspace, rank_idx, sm_idx, thread_idx);
+    } else {
+        gin_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, ncclTeamTagWorld, kTag, kFlushStores>(
+            gin.nccl_dev_comm, 1, rank_idx, sm_idx, thread_idx);
+    }
+}
+
+template <int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs, int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag,
+          bool kFlushStores = true>
+__forceinline__ __device__ void scaleout_barrier_wo_local_sync(
+    const handle::NCCLGin& gin,
+    const int& scaleout_rank_idx, const int& scaleup_rank_idx,
+    const int& sm_idx, const int& thread_idx) {
+    gin_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, ncclTeamTagRail, kTag, kFlushStores>(
+        gin.nccl_dev_comm, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+}
+
+template <bool kIsScaleupNVLink,
+          int kNumScaleoutRanks, int kNumScaleupRanks,
+          int kNumSMs, int kNumThreads, int kNumQPs,
+          int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag,
+          bool kFlushStores = true, bool kSyncAtStart = true, bool kSyncAtEnd = true>
+__forceinline__ __device__ void gpu_barrier(const handle::NCCLGin& gin,
+                                            const layout::WorkspaceLayout& workspace,
+                                            const int& scaleout_rank_idx, const int& scaleup_rank_idx,
+                                            const int& sm_idx, const int& thread_idx,
+                                            bool do_scaleout = true, bool do_scaleup = true) {
+    // A general TMA store wait to prevent proxy memory issues
+    if constexpr (kFlushStores) {
+        ptx::tma_store_commit();
+        ptx::tma_store_wait();
+        __syncwarp();
+    }
+
+    // All the SMs should wait
+    if constexpr (kSyncAtStart) {
+        cooperative_groups::this_grid().sync();
+    } else {
+        EP_STATIC_ASSERT(not kFlushStores, "No data to be flushed");
+    }
+
+    do_scaleout &= kNumScaleoutRanks > 1;
+    do_scaleup &= kNumScaleupRanks > 1;
+    if (do_scaleup and do_scaleout) {
+        // Do scaleup and scaleout barrier in parallel
+        EP_DEVICE_ASSERT(kNumSMs >= 2 and "At least 2 SMs for a hybrid barrier");
+        if (sm_idx == 0) {
+            // First SM do the scaleup barrier
+            scaleup_barrier_wo_local_sync<kIsScaleupNVLink, kNumScaleupRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores>(
+                gin, workspace, scaleup_rank_idx, sm_idx, thread_idx);
+
+            // We need an extra grid sync, as the scaleout barrier will do a sync after flush, before the barrier
+            // NOTES: this is kind of hacky
+            if constexpr (kFlushStores) 
+                cooperative_groups::this_grid().sync();
+        } else {
+            // The remaining SMs do the scaleout barrier
+            scaleout_barrier_wo_local_sync<kNumScaleoutRanks, kNumSMs - 1, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores>(
+                gin, scaleout_rank_idx, scaleup_rank_idx, sm_idx - 1, thread_idx);
+        }
+    } else if (do_scaleup) {
+        // Scaleup only
+        scaleup_barrier_wo_local_sync<kIsScaleupNVLink, kNumScaleupRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores>(
+            gin, workspace, scaleup_rank_idx, sm_idx, thread_idx);
+    } else if (do_scaleout) {
+        // Scaleout only
+        scaleout_barrier_wo_local_sync<kNumScaleoutRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores>(
+            gin, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+    }
+
+    // All the SMs should wait
+    if constexpr (kSyncAtEnd)
+        cooperative_groups::this_grid().sync();
+}
+
+}  // namespace deep_ep::elastic::comm::unordered

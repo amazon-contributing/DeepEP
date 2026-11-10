@@ -15,7 +15,7 @@
 #include <vector>
 #include <optional>
 
-#include <deep_ep/common/gin_resource_alloc.cuh>
+#include <deep_ep/common/gin_resource_alloc_unordered.cuh>
 
 #include <nccl.h>
 #include <nccl_device.h>
@@ -86,7 +86,8 @@ public:
 
     // Configs
     int num_allocated_qps;
-    elastic::gin_alloc::GinResourceConfig gin_config;
+    bool use_unordered_hybrid_kernel;
+    elastic::gin_alloc::GinResourceConfig gin_config_unordered = {};
 
     // Buffer size
     int64_t num_gpu_bytes;

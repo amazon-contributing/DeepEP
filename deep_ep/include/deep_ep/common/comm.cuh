@@ -1,16 +1,5 @@
 #pragma once
 
-// MIT License
-//
-// Copyright (c) 2025 DeepSeek
-// Changes and additions copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
 #include <cooperative_groups.h>
 #include <nccl.h>
 #include <nccl_device.h>
@@ -18,7 +7,6 @@
 #include <deep_ep/common/handle.cuh>
 #include <deep_ep/common/ptx.cuh>
 #include <deep_ep/common/layout.cuh>
-#include <deep_ep/common/qp_mapping.cuh>
 
 namespace deep_ep::elastic::comm {
 
@@ -38,20 +26,6 @@ static constexpr int kHybridCombineTag1 = 9;
 
 // Some reserved count
 static constexpr int kFlushAllAllocatedQPs = -1;
-
-// A signal can be backed by a counter this many bits wide, so it wraps while the shadow it is
-// compared against keeps counting. Conservative: it must not exceed the narrowest counter any
-// backend uses, and must stay above the largest delta a wait can have outstanding.
-static constexpr int kNumSignalBits = 31;
-
-// Difference between a signal and a shadow. An absolute `signal - base` is wrong from the first
-// wrap on, so take it modulo the counter's range and fold the result into the signed half of
-// that range instead.
-__device__ __forceinline__ int64_t signal_delta(const uint64_t& signal, const uint64_t& base) {
-    constexpr int64_t kRange = int64_t{1} << kNumSignalBits;
-    const int64_t diff = static_cast<int64_t>((signal - base) & (kRange - 1));
-    return diff < kRange / 2 ? diff : diff - kRange;
-}
 
 template <int64_t kNumTimeoutCycles, typename func_t>
 __device__ __forceinline__ void timeout_while(const bool& condition, const func_t& func,
@@ -79,59 +53,9 @@ __device__ __forceinline__ void timeout_while(const func_t& func, const int64_t&
     timeout_while<kNumTimeoutCycles, func_t>(true, func, start_clock);
 }
 
-template <int64_t kNumTimeoutCycles, typename gin_t, typename coop_t>
-__device__ __forceinline__ void flush_with_timeout(const gin_t& gin, const coop_t& coop) {
-    if (gin.flush(coop, cuda::memory_order_acquire, ncclGin_None{},
-                  static_cast<uint64_t>(kNumTimeoutCycles)) != ncclSuccess) {
-        if constexpr (kReportGinQueue) {
-            // Name the context and give the other warps' timeout reports a second to print before the trap
-            printf("DeepEP Gin flush timeout, sm: %d, thread: %d, ctx: %d\n",
-                   static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x), static_cast<int>(gin.contextId));
-            const auto stop = clock64() + kNumOneSecCycles;
-            while (clock64() < stop) {}
-        } else {
-            printf("DeepEP Gin flush timeout, sm: %d, thread: %d\n",
-                   static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x));
-        }
-        ptx::trap();
-    }
-}
-
-// With the `queue` check on, a timed flush after a network-wait timeout tells whether this rank's NIC still
-// holds writes. Compiled out otherwise, since the inlined flush changes the register allocation of the kernels.
-__device__ __forceinline__ void report_gin_queue(const ncclGin& gin,
-                                                 const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
-    if constexpr (kReportGinQueue) {
-        const auto mask = __activemask();
-        if (threadIdx.x % 32 == __ffs(mask) - 1) {
-            const bool drained = gin.flush(ncclCoopThread(), cuda::memory_order_acquire, ncclGin_None{},
-                                           static_cast<uint64_t>(kNumOneSecCycles / 10)) == ncclSuccess;
-            printf("DeepEP GIN queue state, scale-out: %d, scale-up: %d, sm: %d, thread: %d, ctx: %d, NIC drained: %d\n",
-                   scaleout_rank_idx, scaleup_rank_idx, static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x),
-                   static_cast<int>(gin.contextId), static_cast<int>(drained));
-        }
-        __syncwarp(mask);
-    }
-}
-
-// Channels map onto QPs with a BALANCED CONTIGUOUS (block) partition: fill a QP with
-// consecutive channels before spilling to the next (so an SM's channels stay grouped
-// on the same GIN context), and when the channels do not divide the QPs evenly,
-// spread the remainder one-per-QP across the leading QPs instead of leaving a
-// trailing QP idle. Used by all callers (dispatch, hybrid_dispatch, combine,
-// hybrid_combine). The integer partition lives in `qp_mapping.cuh` (host-testable);
-// this wrapper only adds the NCCL resource-sharing mode.
-//   e.g. 48 channels / 4 QPs  -> {12,12,12,12}  (even; identical to before)
-//        4  channels / 3 QPs  -> QP0<-2, QP1<-1, QP2<-1  (was {2,2,0}, QP2 idle)
 template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, bool kWithNotifyWarps = false>
 __device__ __forceinline__ std::pair<int, ncclGinResourceSharingMode> get_qp_mode(
     const int& sm_idx, const int& channel_in_sm_idx, const bool& is_notify_warp = false) {
-    static_assert(kNumQPs >= 1,
-                  "kNumQPs must be >= 1. With 0 the kNumQPs == 1 fast path is skipped, "
-                  "kNumSMs <= kNumAvailableQPs is false, and balanced_partition() is called "
-                  "with q == 0, i.e. n / 0. Compiled for the host this specialization exits on "
-                  "SIGFPE; in a GPU run it produced corrupted output and no reported fault.");
-
     constexpr auto kSharingCTA = NCCL_GIN_RESOURCE_SHARING_CTA;
     constexpr auto kSharingGrid = kNumSMs == 1 ? NCCL_GIN_RESOURCE_SHARING_CTA : NCCL_GIN_RESOURCE_SHARING_GPU;
 
@@ -143,42 +67,22 @@ __device__ __forceinline__ std::pair<int, ncclGinResourceSharingMode> get_qp_mod
     if (is_notify_warp)
         return {0, kSharingCTA};
 
-    // Data channels: QP index from the shared balanced partition, sharing mode from
-    // the branch (CTA when SMs each own their QPs, GPU-wide when SMs share QPs).
-    constexpr int kNumAvailableQPs = kNumQPs - static_cast<int>(kWithNotifyWarps);
-    const int qp_idx = channel_to_qp<kNumSMs, kNumQPs, kNumChannelsPerSM, kWithNotifyWarps>(
-        sm_idx, channel_in_sm_idx, is_notify_warp);
-    if constexpr (kNumSMs <= kNumAvailableQPs)
-        return {qp_idx, kSharingCTA};
-    else
-        return {qp_idx, kSharingGrid};
-}
-
-// Companion to `get_qp_mode`: within a QP, gives a unique per-channel signal id
-// (position of this channel among all channels sharing the same QP). Uses the same
-// BALANCED CONTIGUOUS partition as `get_qp_mode` (see `qp_mapping.cuh`), so the id is
-// the channel's offset within its QP's block:
-//   kNumQPs == 1                : every channel on the single QP -> id = global_channel_idx
-//   kNumSMs <= kNumAvailableQPs : offset within the SM's balanced local-QP block
-//   kNumSMs  > kNumAvailableQPs : offset within the global balanced QP block
-// In all cases id < ceil(channels / qps), so `(qp, id)` is unique per channel and the
-// tuner's per-QP signal budget (sized for ceil(channels / qps)) is never exceeded.
-template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, bool kWithNotifyWarps = false>
-__device__ __forceinline__ int get_qp_signal_id(
-    const int& sm_idx, const int& channel_in_sm_idx) {
-    return channel_to_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, kWithNotifyWarps>(
-        sm_idx, channel_in_sm_idx);
-}
-
-// Per-part indexed-signal id: kNumParts contiguous ids under the channel's base id, one
-// per token part and shared by all sources. The tuner + channel cap guarantee
-// ceil(num_channels / qps) * kNumParts <= gin_indexed_signals_cnt.
-template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, int kNumParts,
-          bool kWithNotifyWarps = false>
-__device__ __forceinline__ int get_per_part_signal_id(
-    const int& sm_idx, const int& channel_in_sm_idx, const int& part_idx) {
-    return get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, kWithNotifyWarps>(
-               sm_idx, channel_in_sm_idx) * kNumParts + part_idx;
+    // Data channels
+    constexpr int kQPStartIdx = static_cast<int>(kWithNotifyWarps);
+    constexpr int kNumAvailableQPs = kNumQPs - kQPStartIdx;
+    if constexpr (kNumSMs <= kNumAvailableQPs) {
+        // A single SM uses an entire QP
+        // e.g., 3 SMs and 10 QPs
+        // SM 0: 0 3 6 9
+        // SM 1: 1 4 7
+        // SM 2: 2 5 8
+        const int num_qps_in_sm = (kNumAvailableQPs / kNumSMs) + (sm_idx < (kNumAvailableQPs % kNumSMs));
+        return {kQPStartIdx + sm_idx + (channel_in_sm_idx % num_qps_in_sm) * kNumSMs, kSharingCTA};
+    } else {
+        // All SMs share all QPs
+        const auto global_channel_idx = sm_idx * kNumChannelsPerSM + channel_in_sm_idx;
+        return {kQPStartIdx + (global_channel_idx % kNumAvailableQPs), kSharingGrid};
+    }
 }
 
 template <int kNumRanks, int kNumSMs, int kNumThreads, int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag>
@@ -239,8 +143,7 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
     // Flush all QPs by all SMs (only needed for release semantics)
     if constexpr (kFlushStores) {
         for (int i = global_warp_idx; i < num_qps; i += kNumSMs * kNumWarps) {
-            flush_with_timeout<kNumTimeoutCycles>(ncclGin(nccl_dev_comm, i, NCCL_GIN_RESOURCE_SHARING_CTA),
-                                                  ncclCoopWarp());
+            ncclGin(nccl_dev_comm, i, NCCL_GIN_RESOURCE_SHARING_CTA).flush(ncclCoopWarp());
         }
 
         // World-team barriers may mix direct NVLink writes with GIN signals, so a system-scope
@@ -257,41 +160,28 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
         const auto team = (std::is_same_v<team_t, ncclTeamTagWorld>) ?
             ncclTeamWorld(nccl_dev_comm) : ncclTeamRail(nccl_dev_comm);
         const ncclGin gin(nccl_dev_comm, 0, NCCL_GIN_RESOURCE_SHARING_CTA);
+        for (int i = thread_idx; i < kNumRanks; i += kNumThreads)
+            gin.signal(team, i, ncclGin_SignalInc{static_cast<ncclGinSignal_t>(rank_idx)});
 
-        // Compact signal indexing: (kNumRanks - 1) signal slots per rank. Sender rank_idx
-        // writes to every peer i at the slot that identifies *itself* in the peer's
-        // enumeration:
-        //   sig = (rank_idx < i) ? rank_idx : (rank_idx - 1)
-        // So on receiver R, each of the (kNumRanks - 1) slots gets exactly +1 from a
-        // distinct sender, and the wait side just iterates all slots looking for one
-        // increment per slot.
+        // TODO(NCCL): Using the official NCCL wait signal API, after they added timeout check.
         for (int i = thread_idx; i < kNumRanks; i += kNumThreads) {
-            if (i == rank_idx) continue;
-            const auto sig = static_cast<ncclGinSignal_t>((rank_idx < i) ? rank_idx : (rank_idx - 1));
-            gin.signal(team, i, ncclGin_SignalInc{sig});
-        }
-
-        for (int i = thread_idx; i < kNumRanks - 1; i += kNumThreads) {
             const auto signal_idx = static_cast<ncclGinSignal_t>(i);
             const auto shadow_ptr = gin.getSignalShadowPtr(signal_idx);
             const auto target = ++(*shadow_ptr);
 
-            // Wait through NCCL's own API: it compares within `kNumSignalBits` so the signal
-            // wrapping is handled and reports a timeout.
-            // The timeout overload needs NCCL >= 2.31.2
-            if (gin.waitSignal(ncclCoopThread(), signal_idx, target, kNumSignalBits,
-                               cuda::memory_order_acquire,
-                               static_cast<uint64_t>(kNumTimeoutCycles)) != ncclSuccess) {
-                printf("DeepEP Gin barrier timeout, tag: %d, scaleout: %d, scaleup: %d, thread: %d, "
-                       "slot: %d, target: %lu\n", kTag, scaleout_rank_idx, scaleup_rank_idx, thread_idx,
-                       static_cast<int>(signal_idx), target);
-                report_gin_queue(gin, scaleout_rank_idx, scaleup_rank_idx);
-                // Wait another 1 second to let all threads print information and
-                // trap similar to timeout_while
-                const auto stop = clock64() + kNumOneSecCycles;
-                while (clock64() < stop) {}
-                ptx::trap();
-            }
+            const auto gdaki = static_cast<struct ncclGinGdakiGPUContext*>(gin._ginHandle) + gin.contextId;
+            const auto signal_ptr = reinterpret_cast<uint64_t*>(__ldg(reinterpret_cast<uint64_t*>(&gdaki->signals_table.buffer))) + signal_idx;
+            timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
+                const auto signal = ptx::ld_acquire_sys<uint64_t>(signal_ptr);
+                if (signal >= target)
+                    return true;
+
+                if (is_last_check) {
+                    printf("DeepEP Gin barrier timeout, tag: %d, scaleout: %d, scaleup: %d, thread: %d, "
+                           "signal: %lu, target: %lu\n", kTag, scaleout_rank_idx, scaleup_rank_idx, thread_idx, signal, target);
+                }
+                return false;
+            });
         }
     }
 }
