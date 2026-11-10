@@ -11,11 +11,12 @@
 //
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-#include <deep_ep/common/comm.cuh>
+#include <deep_ep/common/comm_unordered.cuh>
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
-#include <deep_ep/common/gin_resource_alloc.cuh>
+#include <deep_ep/common/gin_resource_alloc_unordered.cuh>
 #include <deep_ep/common/layout.cuh>
+#include <deep_ep/common/layout_unordered.cuh>
 #include <deep_ep/common/math.cuh>
 #include <deep_ep/common/ptx.cuh>
 #include <deep_ep/impls/combine_utils.cuh>
@@ -186,8 +187,8 @@ hybrid_unordered_dispatch_impl(
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0, "Invalid number of experts or ranks");
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
     EP_STATIC_ASSERT(kNumScaleoutWarps == kNumForwardWarps, "Invalid warp size");
-    EP_STATIC_ASSERT(kNumParts <= layout::WorkspaceLayout::kNumMaxParts,
-                     "kNumParts exceeds the per-part header workspace capacity");
+    EP_STATIC_ASSERT(kNumParts <= layout::kNumMaxParts,
+                     "kNumParts exceeds the maximum number of parts");
     EP_STATIC_ASSERT(kNumParts >= 1, "Invalid part count");
     EP_STATIC_ASSERT(kNumSubParts >= 1, "Invalid sub-part count");
     EP_STATIC_ASSERT(kNumSubParts <= kBatchSize,
@@ -219,13 +220,13 @@ hybrid_unordered_dispatch_impl(
 
     // NCCL Gin handle
     // Each warp is a channel
-    const auto [qp_idx, sharing_mode] = comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, kDataChannelsAboveQP0>(
+    const auto [qp_idx, sharing_mode] = comm::unordered::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, kDataChannelsAboveQP0>(
         sm_idx, (warp_idx - kNumNotifyWarps) % kNumChannelsPerSM, warp_idx < kNumNotifyWarps);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
     const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
-    const auto scaleout_token_layout = layout::TokenLayout(
-        kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, nullptr, /*with_scaleout_hdr=*/true);
+    const auto scaleout_token_layout = layout::TokenLayoutUnordered(
+        kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
     constexpr int kNumFwdBuffers = kDoubleBufferForward ? kNumDispatchFwdBuffers : 1;
     const auto tma_pool = layout::BufferLayout<true>(
         token_layout, kNumScaleoutWarps + kNumFwdBuffers * kNumForwardWarps, 1,
@@ -256,16 +257,16 @@ hybrid_unordered_dispatch_impl(
     // channel this warp serves (both sides reduce to the same channel warp index).
     const auto part_signal_id = [&](const int& part_idx) {
         return static_cast<ncclGinSignal_t>(
-            comm::get_per_part_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM,
-                                         kNumParts, kDataChannelsAboveQP0>(
+            comm::unordered::get_per_part_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM,
+                                                    kNumParts, kDataChannelsAboveQP0>(
                 sm_idx, (warp_idx - kNumNotifyWarps) % kNumChannelsPerSM, part_idx));
     };
 
     auto scaleup_buffer = layout::BufferLayout<false>(
         token_layout, kNumScaleupRanks, kNumScaleoutRanks * kNumMaxTokensPerRank, buffer);
-    auto scaleout_send_buffer = layout::BufferLayout<false>(
+    auto scaleout_send_buffer = layout::BufferLayoutUnordered<false>(
         scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleup_buffer.get_buffer_end_ptr());
-    auto scaleout_recv_buffer = layout::BufferLayout<false>(
+    auto scaleout_recv_buffer = layout::BufferLayoutUnordered<false>(
         scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleout_send_buffer.get_buffer_end_ptr());
 
     // Zero the in-band headers of the remote sources before the entry barrier. The header words
@@ -285,8 +286,8 @@ hybrid_unordered_dispatch_impl(
         ptx::fence_release_sys();
     }
 
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
+    comm::unordered::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
+                                 kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
 
     // Init TMA for scale-out and forward warps
@@ -406,7 +407,7 @@ hybrid_unordered_dispatch_impl(
                                    is_expert_reduction ? "expert" : "rank",
                                    scaleout_rank_idx, scaleup_rank_idx, thread_idx, j,
                                    decoded);
-                            comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
+                            comm::unordered::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
                         }
                         return false;
                     });
@@ -525,13 +526,13 @@ hybrid_unordered_dispatch_impl(
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
             }
 
-            comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
+            comm::unordered::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
         }
     } else if (warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
         const int scaleout_warp_idx = warp_idx - kNumNotifyWarps;
         const int channel_idx = sm_idx * kNumChannelsPerSM + scaleout_warp_idx;
-        const auto stage_part_header = [&](layout::BufferLayout<false>& send_ch,
-                                           const int& slot, const int& count, const bool& more) {
+        const auto stage_part_header = [&](layout::BufferLayoutUnordered<false>& send_ch,
+                                                    const int& slot, const int& count, const bool& more) {
             auto* hdr = send_ch.get_token_buffer(slot).get_hdr_ptr();
             *hdr = pack_scaleout_header(count, more);
             ptx::fence_acq_rel_sys();
@@ -799,7 +800,7 @@ hybrid_unordered_dispatch_impl(
         // Flush unflushed tails
         update_scaleout_tail(true);
 
-        comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
+        comm::unordered::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
 
     } else {
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
@@ -873,7 +874,7 @@ hybrid_unordered_dispatch_impl(
                 #pragma unroll
                 for (int k = 0; k < kNumParts; ++ k) {
                     const int64_t landed = ptx::exchange(
-                        comm::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]), 0);
+                        comm::unordered::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]), 0);
 
                     const int num_subs = num_sub_parts_at<kNumSubParts>(part_size(k));
                     int sub_count[kNumSubParts];
@@ -942,7 +943,7 @@ hybrid_unordered_dispatch_impl(
                                stored_finish_flag, stored_scaleout_tail_idx,
                                static_cast<int>(anomaly_detected), anomaly_part, anomaly_num_valid,
                                static_cast<int>(missing_part >= 0), missing_part, missing_num_valid, missing_landed);
-                    comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
+                    comm::unordered::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
                 }
                 return false;
             });
@@ -1115,14 +1116,14 @@ hybrid_unordered_dispatch_impl(
             if (lane_idx == k and expected_k > 0) {
                 comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
                     const int64_t landed =
-                        comm::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]);
+                        comm::unordered::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]);
                     if (landed >= static_cast<int64_t>(expected_k))
                         return true;
                     if (is_last_check) {
                         printf("DeepEP hybrid dispatch (epilogue shadow drain) timeout, scale-out: %d, scale-up: %d, "
                                "channel: %d, part: %d, landed: %lld, expected: %d\n",
                                scaleout_rank_idx, scaleup_rank_idx, channel_idx, k, (long long)landed, expected_k);
-                        comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
+                        comm::unordered::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
                     }
                     return false;
                 });
@@ -1138,8 +1139,8 @@ hybrid_unordered_dispatch_impl(
 
     // Scale-up barrier to ensure data arrival
     // As scale-out tokens have already been consumed by forwarders, no need to do scale-out barrier again
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag1, true, true, false>(
+    comm::unordered::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
+                                 kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag1, true, true, false>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx, /* do not scale-out */ false, true);
 
     // Trigger the copy epilogue kernel

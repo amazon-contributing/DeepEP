@@ -90,7 +90,7 @@ struct GinPartAllocation {
 };
 
 // Worst-case number of channels that land on a single GIN context (QP). MUST match the
-// signal-id assignment in `channel_to_signal_id` (`qp_mapping.cuh`) exactly, because the
+// signal-id assignment in `channel_to_signal_id` (`qp_mapping_unordered.cuh`) exactly, because the
 // per-channel signal id is its offset within its QP's block and the provisioned budget has
 // to cover the largest such offset.
 //
