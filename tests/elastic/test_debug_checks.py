@@ -8,7 +8,8 @@
 #
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-# Test the `token_integrity` check of `EP_DEBUG_CHECKS`. The test compiles the kernels with the checks, then:
+# Test the `token_integrity` and `token_sync` checks of `EP_DEBUG_CHECKS`. The test compiles the kernels
+# with the checks. For `token_integrity`, it:
 #   1. runs a clean dispatch and combine, and expects no report,
 #   2. puts one NaN in the dispatch input (BF16 and FP8), and expects a report on each rank
 #      that receives the token, with the correct source and element,
@@ -17,6 +18,8 @@
 #      next window to print how many reports were not printed.
 # Before these steps, `test_corruption` corrupts tokens while dispatch and combine read them, and
 # flips single bits, and compares the reports with a bitwise check against the clean data.
+# For `token_sync`, `test_token_sync` runs dispatch and combine many times and expects
+# no report. A bad signal traps the kernel, so a report also fails the run.
 # The reports come from device printf, so the test captures file descriptor 1.
 
 import argparse
@@ -24,13 +27,14 @@ import contextlib
 import ctypes
 import os
 import re
+import sys
 import tempfile
 import time
 import torch
 import torch.distributed as dist
 
 # The flag must be set before the first kernel compiles
-os.environ['EP_DEBUG_CHECKS'] = 'token_integrity'
+os.environ['EP_DEBUG_CHECKS'] = 'token_integrity,token_sync'
 
 import deep_ep
 from deep_ep.utils.envs import init_dist, dist_print
@@ -46,6 +50,7 @@ _DISPATCH_REPORT = re.compile(r'non-finite token in dispatch, rank: (\d+), recv 
 _COMBINE_REPORT = re.compile(r'non-finite token in combine, rank: (\d+), token: (\d+)/\d+, sources: \d+, '
                              r'bad elements: (\d+)/\d+, first bad: (\d+)')
 _NOT_PRINTED_REPORT = re.compile(r'(\d+) more reports were not printed')
+_SIGNAL_REPORT = 'GIN signal skew'
 
 
 @contextlib.contextmanager
@@ -61,6 +66,12 @@ def capture_device_printf(lines: list):
             yield
             torch.cuda.synchronize()
             libc.fflush(None)
+        except BaseException:
+            # A check that traps fails the step here: show what the kernels printed before the trap
+            libc.fflush(None)
+            f.seek(0)
+            sys.stderr.write(f.read())
+            raise
         finally:
             os.dup2(saved_fd, 1)
             os.close(saved_fd)
@@ -389,6 +400,32 @@ def test_corruption(buffer: deep_ep.ElasticBuffer, args: argparse.Namespace):
 
 
 # noinspection PyShadowingNames
+def test_token_sync(buffer: deep_ep.ElasticBuffer, args: argparse.Namespace):
+    """The signals must be in the expected state at each entry of the unordered dispatch and combine"""
+    num_tokens, hidden, num_experts = args.num_tokens, args.hidden, args.num_experts
+
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda').abs()
+    topk_weights, topk_idx = torch.topk(scores, args.num_topk, dim=-1, largest=True, sorted=False)
+    topk_idx = topk_idx.to(deep_ep.topk_idx_t)
+    x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+
+    def dispatch_and_combine():
+        recv_x, _, recv_topk_weights, handle, _ = buffer.dispatch(
+            x=x, topk_idx=topk_idx, topk_weights=topk_weights,
+            num_max_tokens_per_rank=num_tokens, num_experts=num_experts, num_sms=args.num_sms)
+        buffer.combine(x=recv_x, handle=handle, topk_weights=recv_topk_weights)
+
+    dist_print(' > Dispatch and combine', once_in_node=True)
+    lines = []
+    with capture_device_printf(lines):
+        for _ in range(args.num_signal_iters):
+            dispatch_and_combine()
+    expect(not any(_SIGNAL_REPORT in line for line in lines), f'signal reports: {lines}')
+    dist.barrier()
+    dist_print(' > Token sync checks passed', once_in_node=True)
+
+
+# noinspection PyShadowingNames
 @torch.inference_mode()
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
@@ -398,13 +435,14 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # The corruption checks run first: the rate-limit step of `test_debug_checks` uses up the report budget
     test_corruption(buffer, args)
     test_debug_checks(buffer, args)
+    test_token_sync(buffer, args)
     buffer.destroy()
     dist.barrier()
     dist.destroy_process_group()
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Test the token_integrity check of EP_DEBUG_CHECKS')
+    parser = argparse.ArgumentParser(description='Test the token_integrity and token_sync checks of EP_DEBUG_CHECKS')
     parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')
     parser.add_argument('--num-tokens', type=int, default=1024, help='Number of tokens')
     parser.add_argument('--hidden', type=int, default=7168, help='Hidden dimension size')
@@ -415,6 +453,7 @@ if __name__ == '__main__':
     parser.add_argument('--num-corruption-iters', type=int, default=48,
                         help='Iterations of each racing-write corruption check')
     parser.add_argument('--num-flips', type=int, default=24, help='Tokens with a bit flip, for each bit')
+    parser.add_argument('--num-signal-iters', type=int, default=16, help='Dispatch and combine iterations of the signal check')
     args = parser.parse_args()
 
     torch.multiprocessing.spawn(test_loop, args=(args.num_processes, args), nprocs=args.num_processes)
