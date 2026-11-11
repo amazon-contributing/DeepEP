@@ -171,6 +171,11 @@ void NCCLSymmetricMemoryContext::create_dev_comm(jit::NoRefPtr& out, const bool&
         // configuration; direct mode and the ordered hybrid kernels keep the
         // upstream requirements untouched.
         if (allow_hybrid_mode and not elastic::use_ordered_hybrid_kernel()) {
+        // Provider budget in QP units per GPU (`kTotalQPBudget`: one EFA NIC's completion
+        // counters); a platform whose GIN connection spreads the contexts over several NICs
+        // widens it through EP_GIN_QP_BUDGET, which raises the indexed-signal count every
+        // context gets at a given context count.
+        const int qp_budget = get_env<int>("EP_GIN_QP_BUDGET", elastic::gin_alloc::kTotalQPBudget);
         auto resolve_gin_context_cnt = [&]() -> int {
             const int requested = (this->num_allocated_qps == 0)
                 ? elastic::gin_alloc::kDefaultGinContextCnt
@@ -186,11 +191,27 @@ void NCCLSymmetricMemoryContext::create_dev_comm(jit::NoRefPtr& out, const bool&
                        requested, ctx,
                        elastic::gin_alloc::kMinGinContextCnt,
                        elastic::gin_alloc::kMaxGinContextCnt);
+            // Each context needs a signal per peer rail team, which bounds the count by the rail
+            // size and the budget (`max_gin_context_cnt_for_rail`); above it, fewer contexts.
+            if (scaleout_active) {
+                const int rail_cap = elastic::gin_alloc::max_gin_context_cnt_for_rail(num_rail_ranks, qp_budget);
+                if (ctx > rail_cap) {
+                    printf("[WARN] DeepEP clamped num_allocated_qps from %d to %d: %d contexts leave fewer "
+                           "than %d indexed signals each (one per peer rail team) within the GIN QP budget "
+                           "%d; raise EP_GIN_QP_BUDGET where the platform allows or accept shared QPs\n",
+                           ctx, rail_cap, ctx, num_rail_ranks - 1, qp_budget);
+                    ctx = rail_cap;
+                }
+            }
             return ctx;
         };
 
         if (scaleout_active) {
-            gin_config = elastic::gin_alloc::make_gin_resources(resolve_gin_context_cnt());
+            const int ctx = resolve_gin_context_cnt();
+            EP_HOST_ASSERT(elastic::gin_alloc::gin_indexed_signals_for(ctx, qp_budget) >= 1 and
+                           "EP_GIN_QP_BUDGET leaves no indexed signal per GIN context at this "
+                           "context count; raise the budget or reduce num_allocated_qps");
+            gin_config = elastic::gin_alloc::make_gin_resources(ctx, qp_budget);
         } else {
             gin_config.gin_context_cnt = resolve_gin_context_cnt();
             gin_config.gin_indexed_signals_cnt = 0;
