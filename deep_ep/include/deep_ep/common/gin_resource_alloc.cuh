@@ -17,9 +17,24 @@
 
 namespace deep_ep::elastic::gin_alloc {
 
-// NCCL GIN: provider resource budget.
+// NCCL GIN: provider resource budget, in QP units per GPU. A context costs 2 units (its data and
+// PutValue endpoints) plus 1 per indexed signal, so n contexts of S signals fit when
+// n * (2 + S) <= kTotalQPBudget. Every unit is one QP on the NIC the GIN connection puts the
+// context on, and the context also binds 2 + 2 S of that NIC's completion counters, at most two
+// per unit. Both limits are per NIC generation (read them with `fi_info -p efa -v`: cntr_cnt, and
+// `ibv_devinfo -v`: max_qp); the generations measured so far report 512 counters and 256 or 768
+// QPs, so 256 is the largest budget that fits every context count in [2, 41] on all of them when
+// one NIC carries all of a GPU's contexts. `EP_GIN_QP_BUDGET` (read at buffer creation) widens it
+// where the connection spreads the contexts round-robin over several NICs (ceil(n / rails) of them
+// then share one NIC): with two NICs of 512 counters and >= 256 QPs each, 384 fits every context
+// count in [2, 41] and 512 does not (an odd count puts the extra context on one NIC). Verify the
+// rail count and the per-NIC limits of the platform before raising it. The kernels take the
+// resulting signal count as a template argument, so an override is consistent end to end.
 static constexpr int kTotalQPBudget              = 256;
-static constexpr int kMaxGinContextBudget        = 17;
+// Context ceiling: one data QP per SM up to 40 SMs after the notify context (see `get_qp_mode`:
+// an SM owns a QP only when the kernel runs on at most kNumQPs - 1 SMs, and the combine proxy's
+// thread-exclusive put needs that ownership).
+static constexpr int kMaxGinContextBudget        = 41;
 
 // Design constant: ScaleOut warps per SM used by the auto-tuner's budget math.
 // Matches the buffer's `!prefer_overlap_with_compute` cap on `num_channels_per_sm`
@@ -36,7 +51,10 @@ static constexpr int kMaxWarpsPerSM              = 4;
 // across all nodes in the rail group, so it is shared rail-wide — the signal
 // count scales with the number of channels (warps), not with the number of
 // nodes.
-static constexpr int kMaxSM           = (kTotalQPBudget - 2*kMaxGinContextBudget)/kMaxWarpsPerSM;
+//
+// Pinned rather than derived from the budget: (256 - 2 * 17) / 4 = 55 at the original 17-context
+// ceiling, and the checks below are written against this SM count.
+static constexpr int kMaxSM           = 55;
 static constexpr int kMaxScaleoutWarps           = kMaxSM * kMaxWarpsPerSM;
 
 struct GinResourceConfig {
@@ -54,28 +72,34 @@ static constexpr int kMaxGinContextCnt           = kMaxGinContextBudget;
 static constexpr int kDefaultGinContextCnt       = 13;
 
 // Per-context indexed-signal budget, workaround for current limitations in provider.
-__forceinline__ __device__ __host__ constexpr int gin_indexed_signals_for(int gin_context_cnt) {
-    return (kTotalQPBudget - 2 * gin_context_cnt) / gin_context_cnt;
+__forceinline__ __device__ __host__ constexpr int gin_indexed_signals_for(int gin_context_cnt,
+                                                                          int qp_budget = kTotalQPBudget) {
+    return (qp_budget - 2 * gin_context_cnt) / gin_context_cnt;
 }
 
-__forceinline__ __device__ __host__ constexpr GinResourceConfig make_gin_resources(int gin_context_cnt) {
-    return GinResourceConfig{gin_indexed_signals_for(gin_context_cnt), gin_context_cnt};
+__forceinline__ __device__ __host__ constexpr GinResourceConfig make_gin_resources(int gin_context_cnt,
+                                                                                   int qp_budget = kTotalQPBudget) {
+    return GinResourceConfig{gin_indexed_signals_for(gin_context_cnt, qp_budget), gin_context_cnt};
 }
 
 // Each ScaleOut warp (== channel) needs its own dedicated indexed signal id, so the total
-// signal budget (ctx * signals/ctx) must cover the worst-case warp count for EVERY legal
-// context count, not just the default. The tightest points are ctx = 13 and ctx = 17, both at
-// 221 against the 220-warp ceiling -- one signal of slack. Do not raise `kMaxSM` /
-// `kMaxWarpsPerSM`, widen the context range, or lower `kTotalQPBudget` without re-checking.
+// signal budget (ctx * signals/ctx) must cover the worst-case warp count for every context count
+// up to `kMaxGinContextCntFullWarps` (the ceiling before it was widened to one QP per SM), not
+// just the default. The tightest points are ctx = 13 and ctx = 17, both at 221 against the
+// 220-warp ceiling -- one signal of slack. Do not raise `kMaxSM` / `kMaxWarpsPerSM`, widen this
+// range, or lower `kTotalQPBudget` without re-checking. Above 17 contexts the default budget leaves
+// fewer signals per context; `compute_part_allocation` then lowers the parts and, at high SM
+// counts, the channels per SM to fit (the second check, after it, is the guarantee that remains).
+static constexpr int kMaxGinContextCntFullWarps  = 17;
 __forceinline__ __host__ constexpr bool all_gin_context_counts_cover_warps() {
-    for (int ctx = kMinGinContextCnt; ctx <= kMaxGinContextCnt; ++ ctx)
+    for (int ctx = kMinGinContextCnt; ctx <= kMaxGinContextCntFullWarps; ++ ctx)
         if (ctx * gin_indexed_signals_for(ctx) < kMaxScaleoutWarps)
             return false;
     return true;
 }
 static_assert(all_gin_context_counts_cover_warps(),
               "GIN layout cannot give each ScaleOut warp a dedicated signal id "
-              "for every legal context count");
+              "for every context count up to kMaxGinContextCntFullWarps");
 
 // Preferred (and workspace-sizing) maximum for per-part signalling.
 static constexpr int kMaxParts = 4;
@@ -141,6 +165,19 @@ __forceinline__ __device__ __host__ constexpr GinPartAllocation compute_part_all
 #endif
     return alloc;
 }
+
+// The guarantee kept for every legal context count at the default budget: a kernel on up to
+// `kMaxSM` SMs always fits at least one channel per SM (one part), so the host assert in
+// `compute_part_allocation` cannot fire below that SM count. Beyond 17 contexts it is the parts
+// and then the channels per SM that give, never the allocation itself.
+__forceinline__ __host__ constexpr bool all_gin_context_counts_host_one_channel() {
+    for (int ctx = kMinGinContextCnt; ctx <= kMaxGinContextCnt; ++ ctx)
+        if (channels_per_context(kMaxSM, ctx - 1, 1) > gin_indexed_signals_for(ctx))
+            return false;
+    return true;
+}
+static_assert(all_gin_context_counts_host_one_channel(),
+              "GIN layout cannot host one channel per SM at kMaxSM for every legal context count");
 
 // Kernel-side entry points: derive the per-channel part count (and verify the launched
 // channel count) as compile-time constants from the provisioned indexed-signal budget.

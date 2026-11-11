@@ -342,6 +342,7 @@ The library provides some environment variables, which may be useful:
     - `EP_OVERRIDE_RDMA_SL`: integer, override the RDMA service level index for traffic isolation
     - `EP_DISABLE_GIN`: `0` or `1`, disable the NCCL Gin backend (fall back to non-Gin path), `0` by default
     - `EP_HYBRID_KERNEL`: `ordered` or `unordered`, select the hybrid (scale-out) dispatch/combine kernel pair. See [Hybrid kernel variants](#hybrid-kernel-variants-ordered-and-unordered)
+    - `EP_GIN_QP_BUDGET`: integer, the NCCL Gin provider budget of the unordered kernels in QP units per GPU, `256` by default. A GIN context costs 2 units plus 1 per indexed signal, so the budget sets how many signals each of the `num_allocated_qps` contexts gets. Every unit is one QP on the NIC that carries the context, and a context also binds 2 + 2 × signals of that NIC's completion counters; the EFA NIC generations measured so far report 512 counters and 256 or 768 QPs per NIC (`fi_info -p efa -v`: `cntr_cnt`; `ibv_devinfo -v`: `max_qp`), so `256` fits every context count when one NIC carries all of a GPU's contexts. Where the connection spreads them over two such NICs, `384` fits every context count and `512` does not. Verify the rail count and the per-NIC limits of the platform before raising it
 - JIT
     - `EP_JIT_DEBUG`: `0` or `1`, print JIT debugging information, `0` by default
     - `EP_JIT_CACHE_DIR`: string, cache directory for compiled kernels, `$HOME/.deep_ep` by default
