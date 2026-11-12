@@ -70,6 +70,10 @@ static constexpr int kMaxGinContextCnt           = kMaxGinContextBudget;
 // reserving the notify context. The resulting 221 signals leave one above the
 // 220-warp ceiling checked below.
 static constexpr int kDefaultGinContextCnt       = 13;
+// The default of the previous kernel generation (11 contexts -> 21 signals/context), kept for
+// an NCCL without the thread-exclusive put: there the JIT selects that generation's kernels
+// (`use_thread_put_unordered_kernels`), and this keeps their QP layout the same as well.
+static constexpr int kLegacyGinContextCnt        = 11;
 
 // Per-context indexed-signal budget, workaround for current limitations in provider.
 __forceinline__ __device__ __host__ constexpr int gin_indexed_signals_for(int gin_context_cnt,

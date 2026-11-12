@@ -177,9 +177,9 @@ void NCCLSymmetricMemoryContext::create_dev_comm(jit::NoRefPtr& out, const bool&
         // context gets at a given context count.
         const int qp_budget = get_env<int>("EP_GIN_QP_BUDGET", elastic::gin_alloc::kTotalQPBudget);
         auto resolve_gin_context_cnt = [&]() -> int {
-            const int requested = (this->num_allocated_qps == 0)
-                ? elastic::gin_alloc::kDefaultGinContextCnt
-                : this->num_allocated_qps;
+            const int requested = (this->num_allocated_qps != 0) ? this->num_allocated_qps
+                : elastic::use_thread_put_unordered_kernels() ? elastic::gin_alloc::kDefaultGinContextCnt
+                : elastic::gin_alloc::kLegacyGinContextCnt;
             int ctx = requested;
             if (ctx < elastic::gin_alloc::kMinGinContextCnt)
                 ctx = elastic::gin_alloc::kMinGinContextCnt;
