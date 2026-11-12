@@ -826,7 +826,11 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             // Owns per-ring GIN contexts (built inline so each put routes to its
             // channel's QP). Best when per-put cost is high enough that warp-lockstep
             // parallelism doesn't pay off (B200 SM100).
-            if (ptx::elect_one_sync()) {
+            const bool is_proxy_lane = ptx::elect_one_sync();
+            const unsigned proxy_lane_mask = diag::hang_detector::kEnabled ? ptx::gather(is_proxy_lane) : 0u;
+            if constexpr (diag::hang_detector::kEnabled)
+                diag::hang_detector::init<kNumWarps - kNumDataWarps>();
+            if (is_proxy_lane) {
                 int num_forward_warps_done_cnt = 0;
                 unsigned tail[kNumForwardWarps] = {};
                 bool ring_done[kNumForwardWarps] = {};
@@ -864,6 +868,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
                         const auto& desc = proxy_ring_layout.get_ring(forward_warp_idx)[
                             tail[forward_warp_idx] % static_cast<unsigned>(kProxyRingDepth)];
+                        if constexpr (diag::hang_detector::kEnabled)
+                            diag::hang_detector::post_begin();
                         gin_ctx[forward_warp_idx].put<ncclTeamTagRail>(
                             desc.recv_ptr, desc.send_ptr,
                             desc.num_bytes,
@@ -871,6 +877,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                             0, /*flags=0*/
                             ncclGin_SignalAdd{ring_signal_id[forward_warp_idx], static_cast<uint64_t>(1)}
                         );
+                        if constexpr (diag::hang_detector::kEnabled)
+                            diag::hang_detector::post_end();
 
                         ++ tail[forward_warp_idx];
                         ptx::st_release_cta(proxy_ring_layout.get_tail(forward_warp_idx), tail[forward_warp_idx]);
@@ -880,12 +888,20 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     if (gin_put_ops == 0)
                         __nanosleep(1000);
                 }
+
+                if constexpr (diag::hang_detector::kEnabled)
+                    diag::hang_detector::done(proxy_lane_mask);
+            } else if constexpr (diag::hang_detector::kEnabled) {
+                diag::hang_detector::watch<kNumTimeoutCycles>(proxy_lane_mask, "hybrid combine proxy", scaleout_rank_idx, scaleup_rank_idx);
             }
             __syncwarp();
         } else {
             // Parallel design: each lane represents one forward warp within this SM
             // and drains its own ring. Warp-lockstep parallelism across up to
             // kNumForwardWarps lanes — best when per-put cost is small (H200 SM90).
+            constexpr unsigned kProxyLaneMask = kNumForwardWarps >= 32 ? 0xffffffffu : (1u << kNumForwardWarps) - 1;
+            if constexpr (diag::hang_detector::kEnabled)
+                diag::hang_detector::init<kNumWarps - kNumDataWarps>();
             if (lane_idx < kNumForwardWarps) {
                 const auto channel_idx = sm_idx * kNumChannelsPerSM + lane_idx;
                 const auto signal_id = static_cast<ncclGinSignal_t>(
@@ -909,6 +925,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     }
 
                     const auto& desc = ring[tail % static_cast<unsigned>(kProxyRingDepth)];
+                    if constexpr (diag::hang_detector::kEnabled)
+                        diag::hang_detector::post_begin();
                     gin.put<ncclTeamTagRail>(
                         desc.recv_ptr, desc.send_ptr,
                         desc.num_bytes,
@@ -916,10 +934,17 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                         0, /*flags=0*/
                         ncclGin_SignalAdd{signal_id, static_cast<uint64_t>(1)}
                     );
+                    if constexpr (diag::hang_detector::kEnabled)
+                        diag::hang_detector::post_end();
 
                     ptx::st_release_cta(proxy_ring_layout.get_tail(lane_idx), tail + 1);
                     ++ tail;
                 }
+
+                if constexpr (diag::hang_detector::kEnabled)
+                    diag::hang_detector::done(kProxyLaneMask);
+            } else if constexpr (diag::hang_detector::kEnabled) {
+                diag::hang_detector::watch<kNumTimeoutCycles>(kProxyLaneMask, "hybrid combine proxy", scaleout_rank_idx, scaleup_rank_idx);
             }
         }
     }

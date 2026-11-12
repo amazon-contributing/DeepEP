@@ -74,13 +74,14 @@ constexpr int kDebugCheckGinQueue = 1 << 0;
 constexpr bool kReportGinQueue = (kDebugChecks & kDebugCheckGinQueue) != 0;
 constexpr int kDebugCheckTokens = 1 << 1;   // Scan each token in the dispatch and combine epilogues
 constexpr int kDebugCheckTokenSync = 1 << 2;   // Check the GIN signals at the entry of the unordered kernels
+constexpr int kDebugCheckHangDetector = 1 << 3;   // Report a network transfer of the unordered kernels that never returns
 
 struct DebugCheckName {
     const char* name;
     int bit;
 };
 constexpr DebugCheckName kDebugCheckNames[] = {{"queue", kDebugCheckGinQueue}, {"token_integrity", kDebugCheckTokens},
-                                              {"token_sync", kDebugCheckTokenSync}};
+                                              {"token_sync", kDebugCheckTokenSync}, {"hang_detector", kDebugCheckHangDetector}};
 
 template <int kNumBits> struct int_with_bits;
 template <> struct int_with_bits<8>  { using type = int8_t;  };
@@ -102,5 +103,11 @@ constexpr int kNumAlignedSFPacks = 16 / sizeof(sf_pack_t);
 constexpr int kNumMaxChannels = 1024;
 constexpr int kGinQPDepth = 1024;
 constexpr int kGinQPFlushDepth = 768;
+
+// Words of the `hang_detector` check at the end of the dynamic shared memory, one per warp of the CTA in the
+// dispatch (`diag::hang_detector::guarded_post`) or one per lane of the proxy warp in the combine
+// (`diag::hang_detector::init`), which assert their counts against this budget
+constexpr int kNumMaxWarpsPerCTA = 1024 / 32;
+constexpr int kNumHangDetectorSmemBytes = kNumMaxWarpsPerCTA * sizeof(unsigned long long);
 
 } // namespace deep_ep
