@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <string>
 
+#include <nccl.h>
+
 #include <deep_ep/common/exception.cuh>
 
 #include "../../utils/system.hpp"
@@ -56,6 +58,28 @@ static bool use_ordered_hybrid_kernel() {
 static int get_debug_check_mask() {
     static const int mask = get_debug_checks();
     return mask;
+}
+
+// The unordered kernels come in two generations. The current one hands the combine's whole scale-out
+// side to a single proxy lane per SM, which posts thread-exclusively (NCCL_GIN_RESOURCE_SHARING_THREAD)
+// on a QP the SM owns; its dispatch records the forward list as two FIFOs (remote tokens first) for
+// that combine to replay. The thread-exclusive put (NVIDIA/nccl ad35c997) is first released in NCCL 2.32.6.
+// On an older NCCL the same lane would post on the CTA-shared path, serially, and the combine is
+// slower than the previous kernels; so without the thread-exclusive put the JIT selects the previous
+// generation of the dispatch, its copy epilogue and the combine (`*_legacy.cuh`, the kernels of DeepEP
+// a209bc5, the main this branch is based on). The value is read once per process from the loaded library, the same one the JIT passes as `EP_NCCL_RUNTIME_VERSION`;
+// the header names differ, so the JIT cache keeps the two generations apart.
+static bool use_thread_put_unordered_kernels() {
+    static const bool thread_put = [] {
+        int version = 0;
+        NCCL_CHECK(ncclGetVersion(&version));
+        const bool result = version >= NCCL_VERSION(2, 32, 6);
+        if (not result)
+            printf("DeepEP unordered kernels: NCCL %d.%d.%d has no thread-exclusive GIN put, using the previous "
+                   "dispatch/combine generation\n", version / 10000, (version % 10000) / 100, version % 100);
+        return result;
+    }();
+    return thread_put;
 }
 
 } // namespace deep_ep::elastic

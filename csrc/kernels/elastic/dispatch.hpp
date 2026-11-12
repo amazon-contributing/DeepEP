@@ -104,7 +104,7 @@ public:
                 args.num_experts, args.num_topk, args.expert_alignment,
                 args.num_qps, args.num_timeout_cycles);
         } else {
-            header_name = "hybrid_dispatch_unordered";
+            header_name = use_thread_put_unordered_kernels() ? "hybrid_dispatch_unordered" : "hybrid_dispatch_unordered_legacy";
             func_name = fmt::format("hybrid_unordered_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
@@ -341,8 +341,10 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+        // The epilogue reads the forward list the dispatch kernel wrote, so it follows the same
+        // generation selection (see `use_thread_put_unordered_kernels`).
         return fmt::format(R"(
-#include <deep_ep/impls/dispatch_copy_epilogue.cuh>
+#include <deep_ep/impls/{}.cuh>
 
 using namespace deep_ep::elastic;
 
@@ -350,6 +352,7 @@ static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",
+                           use_thread_put_unordered_kernels() ? "dispatch_copy_epilogue" : "dispatch_copy_epilogue_legacy",
                            args.do_expand, args.cached_mode, args.do_zero_padding,
                            args.launch_args.grid_dim.first, args.num_channels, args.num_warps,
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
