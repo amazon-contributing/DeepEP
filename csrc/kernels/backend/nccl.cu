@@ -172,9 +172,9 @@ void NCCLSymmetricMemoryContext::create_dev_comm(jit::NoRefPtr& out, const bool&
         // upstream requirements untouched.
         if (allow_hybrid_mode and not elastic::use_ordered_hybrid_kernel()) {
         auto resolve_gin_context_cnt = [&]() -> int {
-            const int requested = (this->num_allocated_qps == 0)
-                ? elastic::gin_alloc::kDefaultGinContextCnt
-                : this->num_allocated_qps;
+            const int requested = (this->num_allocated_qps != 0) ? this->num_allocated_qps
+                : elastic::use_thread_put_unordered_kernels() ? elastic::gin_alloc::kDefaultGinContextCnt
+                : elastic::gin_alloc::kLegacyGinContextCnt;
             // Fewer on a larger rail: each context needs one signal per peer rail rank
             const int max_ctx = scaleout_active
                 ? elastic::gin_alloc::max_gin_context_cnt_for_rail(num_rail_ranks)
