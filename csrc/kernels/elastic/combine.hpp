@@ -74,7 +74,8 @@ public:
                                     args.num_topk,
                                     args.num_qps, args.num_timeout_cycles);
         } else {
-            header_name = args.unordered.has_value() ? "hybrid_combine_unordered" : "hybrid_combine";
+            header_name = not args.unordered.has_value() ? "hybrid_combine"
+                        : use_thread_put_unordered_kernels() ? "hybrid_combine_unordered" : "hybrid_combine_unordered_legacy";
             func_name = fmt::format("{}<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}{}>",
                                     args.unordered.has_value() ? "hybrid_unordered_combine_impl" : "hybrid_combine_impl",
                                     args.use_expanded_layout, args.allow_multiple_reduction,

@@ -20,6 +20,8 @@
 #include <deep_ep/common/exception.cuh>
 #include <deep_ep/common/gin_resource_alloc_unordered.cuh>
 
+#include "../elastic/kernel_select.hpp"
+
 #include "../../utils/system.hpp"
 
 namespace deep_ep::elastic {
@@ -32,7 +34,9 @@ static gin_alloc::GinResourceConfig configure_unordered_gin(const ncclComm_t& co
     EP_HOST_ASSERT(false and "EP_HYBRID_KERNEL=unordered requires NCCL 2.31.2 or later");
 #endif
 
-    const int requested = num_allocated_qps == 0 ? gin_alloc::kDefaultGinContextCnt : num_allocated_qps;
+    const int requested = num_allocated_qps != 0 ? num_allocated_qps
+                        : use_thread_put_unordered_kernels() ? gin_alloc::kDefaultGinContextCnt
+                        : gin_alloc::kLegacyGinContextCnt;
     // Fewer on a larger rail: each context needs one signal per peer rail rank
     const int num_rdma_ranks = ncclTeamRail(comm).nRanks;
     const int max_ctx = num_rdma_ranks > 1 ? gin_alloc::max_gin_context_cnt_for_rail(num_rdma_ranks)
