@@ -41,7 +41,7 @@ static dtype_t get_env(const std::string& name, const dtype_t& default_value = d
 //   environment string  ->  check names   ->  one bit per name  ->  mask
 //   ""  or "0"               no names                              0
 //   "1" or "all"             every name in `kDebugCheckNames`      all bits
-//   "queue,nanny"            {"queue", "nanny"}                    kDebugCheckGinQueue | kDebugCheckNanny
+//   "queue,hang_detector"    {"queue", "hang_detector"}            kDebugCheckGinQueue | kDebugCheckHangDetector
 // An unknown name stops here, before any kernel is compiled.
 static std::vector<std::string> debug_check_names(const std::string& value) {
     std::vector<std::string> names;

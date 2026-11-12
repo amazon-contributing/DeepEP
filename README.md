@@ -360,6 +360,7 @@ The library provides some environment variables, which may be useful:
         - `queue`: after a network wait of the unordered kernels times out, a short timed flush of the waiting warp's GIN context prints whether this rank's NIC had completed every write posted on it (`NIC drained: 1`) or still held some (`0`). GIN flush timeouts then also print the context id and wait one second before trapping
         - `token_integrity`: checks that each dispatched and combined token is valid. The check is best effort. It adds a few percent to the dispatch and combine time, so use it only when you debug
         - `token_sync`: checks that the synchronization resources of DeepEP are in the expected state, and stops with an error if one is not. It adds a small amount of latency, so use it only when you debug
+        - `hang_detector`: adds a hang detection mechanism to the network transfers of the unordered kernels. A transfer that does not complete within the GPU timeout is reported with its location instead of hanging silently. It adds a little housekeeping to each transfer, so use it only when you debug
     - `EP_USE_NVIDIA_TOOLS`: `0` or `1`, skip internal profiling when running under external NVIDIA tools, `0` by default
     - `EP_DISABLE_BARRIER_PROFILING`: `0` or `1`, disable barrier-based communication profiling in benchmarks, `0` by default
 - Build
