@@ -190,7 +190,16 @@ void NCCLSymmetricMemoryContext::create_dev_comm(jit::NoRefPtr& out, const bool&
         };
 
         if (scaleout_active) {
-            gin_config = elastic::gin_alloc::make_gin_resources(resolve_gin_context_cnt());
+            const int ctx = resolve_gin_context_cnt();
+            // Provider budget in QP units per GPU (`kTotalQPBudget`: one EFA NIC's completion
+            // counters); a platform whose GIN connection spreads the contexts over several NICs
+            // widens it through EP_GIN_QP_BUDGET, which raises the indexed-signal count every
+            // context gets at a given context count.
+            const int qp_budget = get_env<int>("EP_GIN_QP_BUDGET", elastic::gin_alloc::kTotalQPBudget);
+            EP_HOST_ASSERT(elastic::gin_alloc::gin_indexed_signals_for(ctx, qp_budget) >= 1 and
+                           "EP_GIN_QP_BUDGET leaves no indexed signal per GIN context at this "
+                           "context count; raise the budget or reduce num_allocated_qps");
+            gin_config = elastic::gin_alloc::make_gin_resources(ctx, qp_budget);
         } else {
             gin_config.gin_context_cnt = resolve_gin_context_cnt();
             gin_config.gin_indexed_signals_cnt = 0;

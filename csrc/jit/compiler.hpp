@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <nccl.h>
 #include <nvrtc.h>
 #include <optional>
 #include <regex>
@@ -68,10 +69,27 @@ public:
             flags += fmt::format(" -DEP_DEBUG_CHECKS={}", debug_checks);
         flags += fmt::format(" -I {}/include", nccl_root.c_str());
 
+        // The NCCL the kernels run on, from the loaded library (`check_nccl_so` ties the JIT headers under
+        // `nccl_root` to it). Device code gates paths that need a newer NCCL on this value, e.g. the
+        // thread-exclusive GIN handle of the combine proxy (`comm::kNcclHasThreadPut`). Part of the flags,
+        // so the JIT cache keeps one cubin per NCCL version.
+        int nccl_runtime_version = 0;
+        NCCL_CHECK(ncclGetVersion(&nccl_runtime_version));
+        flags += fmt::format(" -DEP_NCCL_RUNTIME_VERSION={}", nccl_runtime_version);
+
         // Some special flags for EP
         // TODO: make it more general, e.g. `EP_JIT_EXTRA_FLAGS`
         if (int num_topk_idx_bits = get_env("EP_NUM_TOPK_IDX_BITS", 0); num_topk_idx_bits != 0)
             flags += fmt::format(" -DEP_NUM_TOPK_IDX_BITS={}", num_topk_idx_bits);
+
+        // Different configurations have different compute power, so combine's
+        // batching is adjusted accordingly: sweeps found 12 on SM90 (flat from 6 up),
+        // 6 on SM100 (the only interior optimum) and 12 on SM103.
+        const auto [arch_major, arch_minor] = device_runtime->get_arch_pair();
+        int combine_batch_size = 12;
+        if (arch_major == 10 and arch_minor == 0)
+            combine_batch_size = 6;
+        flags += fmt::format(" -DEP_COMBINE_BATCH_SIZE={}", combine_batch_size);
     }
 
     virtual ~Compiler() = default;
