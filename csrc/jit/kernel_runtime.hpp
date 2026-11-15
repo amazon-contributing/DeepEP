@@ -34,7 +34,8 @@ public:
         std::istringstream iss(symbols);
         std::vector<std::string> symbol_names;
         for (std::string line; std::getline(iss, line); ) {
-            if (line.find("STT_FUNC") == 0 and line.find("STO_ENTRY") != std::string::npos and
+            if ((line.find("STT_FUNC") == 0 or line.find("FUNC") == 0) and
+                (line.find(" STO_ENTRY ") != std::string::npos or line.find(" ENTRY ") != std::string::npos) and
                 std::none_of(illegal_names.begin(), illegal_names.end(),
                 [&](const auto name) { return line.find(name) != std::string::npos; })) {
                 const auto last_space = line.rfind(' ');
