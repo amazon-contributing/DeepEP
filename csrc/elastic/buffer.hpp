@@ -899,7 +899,9 @@ public:
         // Decide number of channels by shared memory consumption
         // Only for hybrid version
         int num_channels_per_sm = 1, num_channels = 1;
-        const int num_smem_bytes = jit::device_runtime->get_num_smem_bytes();
+        int num_smem_bytes = jit::device_runtime->get_num_smem_bytes();
+        if (elastic::get_debug_check_mask() & kDebugCheckHangDetector)
+            num_smem_bytes -= kNumHangDetectorSmemBytes;
         if (nccl_context->num_scaleout_ranks > 1) {
             const auto dispatch_token_layout = get_dispatch_token_layout(hidden, x.element_size(), num_sf_packs, num_topk);
             const auto combine_token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
@@ -1114,7 +1116,7 @@ public:
                         nccl_context->is_scaleup_nvlink,
                         num_sms, num_channels_per_sm,
                         nccl_context->gin_config.gin_indexed_signals_cnt,
-                        num_smem_bytes,
+                        jit::device_runtime->get_num_smem_bytes(),
                         num_qps, num_gpu_timeout_cycles,
                         cached_mode, do_cpu_sync,
                         not prefer_overlap_with_compute,
