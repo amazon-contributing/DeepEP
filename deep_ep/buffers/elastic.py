@@ -280,10 +280,21 @@ class ElasticBuffer:
             num_allocated_qps: the number of QPs to allocate for RDMA. One GIN context supplies
                 one QP, so this is also the GIN context count. Pass 0 for automatic, which
                 resolves per hybrid kernel mode (see `EP_HYBRID_KERNEL`):
-                  - unordered (default): 11 QPs and 21 signals per QP, for the balance
-                    between token batch size and the number of QPs. An explicit value
-                    is clamped into [2, 17] with a warning. Requesting fewer
-                    QPs gives each context more signals.
+                  - unordered (default): 13 QPs and 17 signals per QP, which gives a kernel on up
+                    to 12 SMs one data QP per SM after the notify QP; on an NCCL without the
+                    thread-exclusive put (before 2.32.6), where the previous kernel generation
+                    runs, 11 QPs and 21 signals per QP as before. An explicit value is
+                    clamped into [2, 41] with a warning; `num_sms + 1` gives every SM its own QP
+                    (the combine proxy then posts thread-exclusively). The signals per QP follow
+                    from the provider budget, `(budget - 2 * qps) / qps` with budget 256 by
+                    default (`EP_GIN_QP_BUDGET` raises it where the GIN connection spreads
+                    the contexts over several NICs; see the README entry),
+                    so more QPs leave fewer signals per QP: beyond 17 QPs the dispatch's per-part
+                    signalling and, at high SM counts, its channels per SM are reduced to fit.
+                    Every QP also needs one signal per peer node, so the count is further clamped
+                    (with a warning) to `budget / (nodes + 1)`: with the default budget, 41 QPs
+                    up to 5 nodes, 36 at 6, 28 at 8 and 15 at 16 nodes; with budget 384, 41 up
+                    to 8 nodes and 22 at 16. Above that, SMs share QPs again.
                   - ordered: 129 QPs. This mode signals through VA/strong signals rather than
                     the indexed-signal budget, so any explicit value passes through
                     without restriction.
