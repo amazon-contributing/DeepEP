@@ -65,7 +65,8 @@ For V1 performance data, see [docs/legacy.md](docs/legacy.md#performance).
 - Hopper (SM90) GPUs, or other architectures with SM90 PTX ISA support
 - Python 3.8 and above
 - CUDA version
-  - CUDA 12.3 and above for SM90 GPUs
+  - CUDA 12.8 and above for SM90 and SM100 GPUs
+  - CUDA 12.9 and above for SM103 GPUs
 - PyTorch 2.10 and above
 - NCCL 2.30.4 and above
 - NVLink for intranode communication
