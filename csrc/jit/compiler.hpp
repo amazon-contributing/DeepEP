@@ -90,6 +90,12 @@ public:
         if (arch_major == 10 and arch_minor == 0)
             combine_batch_size = 6;
         flags += fmt::format(" -DEP_COMBINE_BATCH_SIZE={}", combine_batch_size);
+
+        // The dispatch's finer split of the final part costs one post per extra sub-put on the SM's shared QP.
+        // On SM103 (B300, two 400 Gb/s NICs per GPU) each QP drains faster than the SM can post the extra
+        // sub-puts, so the split stays regular there; SM90 and SM100 keep their flag strings unchanged.
+        if (arch_major == 10 and arch_minor == 3)
+            flags += " -DEP_NUM_TAIL_SUB_PARTS=2";
     }
 
     virtual ~Compiler() = default;
