@@ -77,7 +77,8 @@ public:
                                     args.num_topk,
                                     args.num_qps, args.num_timeout_cycles);
         } else {
-            header_name = args.use_ordered_kernel ? "hybrid_combine" : "hybrid_combine_unordered";
+            header_name = args.use_ordered_kernel ? "hybrid_combine"
+                        : use_thread_put_unordered_kernels() ? "hybrid_combine_unordered" : "hybrid_combine_unordered_legacy";
             func_name = fmt::format("{}<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}{}>",
                                     args.use_ordered_kernel ? "hybrid_combine_impl" : "hybrid_unordered_combine_impl",
                                     args.use_expanded_layout, args.allow_multiple_reduction,
