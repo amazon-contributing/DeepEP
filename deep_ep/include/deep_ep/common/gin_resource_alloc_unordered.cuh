@@ -17,9 +17,17 @@
 
 namespace deep_ep::elastic::gin_alloc {
 
-// NCCL GIN: provider resource budget.
+// NCCL GIN: provider resource budget, in QP units per GPU. A context costs 2 units plus one per
+// indexed signal, so `num_allocated_qps` = n contexts get S = (256 - 2 n) / n signals each:
+//
+//   ctx 0            notify
+//   ctx 1 .. n-1     data QPs: on num_sms <= n - 1 SMs every SM owns at least one
+//                    (n = num_sms + 1: one each), on more SMs all SMs share them
+//   signals of a QP  channels on the QP x parts <= S (a channel is a ScaleOut warp)
+//   every context    S >= rail ranks - 1 (checked in `create_dev_comm`)
 static constexpr int kTotalQPBudget              = 256;
-static constexpr int kMaxGinContextBudget        = 17;
+// One data QP per SM up to 40 SMs after the notify context
+static constexpr int kMaxGinContextBudget        = 41;
 
 // Design constant: ScaleOut warps per SM used by the auto-tuner's budget math.
 // Matches the buffer's `!prefer_overlap_with_compute` cap on `num_channels_per_sm`
@@ -27,17 +35,6 @@ static constexpr int kMaxGinContextBudget        = 17;
 // can go up to `kNumMaxChannelsPerSM = 8`); worst case just means heavier
 // warps-per-context sharing, not a correctness issue.
 static constexpr int kMaxWarpsPerSM              = 4;
-
-// Upper bound on ScaleOut warps used by any single kernel: 55 SMs × 4 warps = 220.
-//
-// Each ScaleOut warp (== channel) needs its own dedicated signal: e.g. when
-// warp0 (channel0) signals its peer channel0 warp on a remote node, it uses a
-// signal reserved for that channel. That same signal is reused for the channel
-// across all nodes in the rail group, so it is shared rail-wide — the signal
-// count scales with the number of channels (warps), not with the number of
-// nodes.
-static constexpr int kMaxSM           = (kTotalQPBudget - 2*kMaxGinContextBudget)/kMaxWarpsPerSM;
-static constexpr int kMaxScaleoutWarps           = kMaxSM * kMaxWarpsPerSM;
 
 struct GinResourceConfig {
     int gin_indexed_signals_cnt;      // NGinIndexedSignalsPerGinContext (per NCCL context)
@@ -47,13 +44,9 @@ struct GinResourceConfig {
 static constexpr int kMinGinContextCnt           = 2;
 static constexpr int kMaxGinContextCnt           = kMaxGinContextBudget;
 
-// Default context count (== default QP count). 11 contexts -> 21 signals/context.
-// Contexts and signals-per-context are inversely coupled through
-// `gin_indexed_signals_for`, so more QPs means a smaller per-context signal budget. The
-// equivalent alternatives are {5, 6, 7, 8, 9, 14}; everything else loses a part somewhere.
-// Notably 12, 15, 16 and 17 all drop to 3 parts at 12 SMs -- 17 (the provider maximum) leaves
-// only 13 signals/context, and its per-SM QP split puts 4 channels on the busiest QP.
-static constexpr int kDefaultGinContextCnt       = 11;
+// Default context count (== default QP count). 13 contexts -> 17 signals/context, and one
+// data QP per SM up to 12 SMs.
+static constexpr int kDefaultGinContextCnt       = 13;
 
 // Per-context indexed-signal budget, workaround for current limitations in provider.
 __forceinline__ __device__ __host__ constexpr int gin_indexed_signals_for(int gin_context_cnt) {
@@ -64,20 +57,18 @@ __forceinline__ __device__ __host__ constexpr GinResourceConfig make_gin_resourc
     return GinResourceConfig{gin_indexed_signals_for(gin_context_cnt), gin_context_cnt};
 }
 
-// Each ScaleOut warp (== channel) needs its own dedicated indexed signal id, so the total
-// signal budget (ctx * signals/ctx) must cover the worst-case warp count for EVERY legal
-// context count, not just the default. The tightest points are ctx = 13 and ctx = 17, both at
-// 221 against the 220-warp ceiling -- one signal of slack. Do not raise `kMaxSM` /
-// `kMaxWarpsPerSM`, widen the context range, or lower `kTotalQPBudget` without re-checking.
-__forceinline__ __host__ constexpr bool all_gin_context_counts_cover_warps() {
-    for (int ctx = kMinGinContextCnt; ctx <= kMaxGinContextCnt; ++ ctx)
-        if (ctx * gin_indexed_signals_for(ctx) < kMaxScaleoutWarps)
-            return false;
-    return true;
+// Every context needs one indexed signal per peer rail rank, so a rail of R ranks fits at most
+// kTotalQPBudget / (R + 1) contexts: 41 up to 5 nodes, 28 at 8, 15 at 16.
+__forceinline__ __host__ constexpr int max_gin_context_cnt_for_rail(int num_rail_ranks) {
+    const int cap = kTotalQPBudget / (num_rail_ranks + 1);
+    return cap < kMaxGinContextCnt ? cap : kMaxGinContextCnt;
 }
-static_assert(all_gin_context_counts_cover_warps(),
-              "GIN layout cannot give each ScaleOut warp a dedicated signal id "
-              "for every legal context count");
+
+// Each ScaleOut warp (== channel) needs its own indexed signal id on its QP, shared by all
+// nodes of the rail. The signals per context fall as the context count grows, so checking the
+// ceiling covers every count: an SM that owns a data QP always keeps 4 channels.
+static_assert(gin_indexed_signals_for(kMaxGinContextCnt) >= kMaxWarpsPerSM,
+              "GIN layout cannot give 4 channels of an SM a dedicated signal id each");
 
 // Preferred (and workspace-sizing) maximum for per-part signalling.
 static constexpr int kMaxParts = 4;

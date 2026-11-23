@@ -33,11 +33,15 @@ static gin_alloc::GinResourceConfig configure_unordered_gin(const ncclComm_t& co
 #endif
 
     const int requested = num_allocated_qps == 0 ? gin_alloc::kDefaultGinContextCnt : num_allocated_qps;
-    const int ctx = std::clamp(requested, gin_alloc::kMinGinContextCnt, gin_alloc::kMaxGinContextCnt);
+    // Fewer on a larger rail: each context needs one signal per peer rail rank
+    const int num_rdma_ranks = ncclTeamRail(comm).nRanks;
+    const int max_ctx = num_rdma_ranks > 1 ? gin_alloc::max_gin_context_cnt_for_rail(num_rdma_ranks)
+                                           : gin_alloc::kMaxGinContextCnt;
+    const int ctx = std::clamp(requested, gin_alloc::kMinGinContextCnt, max_ctx);
     if (ctx != requested)
         printf("[WARN] DeepEP clamped num_allocated_qps from %d to %d: the unordered "
                "GIN layout supports [%d, %d] contexts (one GIN context supplies one QP)\n",
-               requested, ctx, gin_alloc::kMinGinContextCnt, gin_alloc::kMaxGinContextCnt);
+               requested, ctx, gin_alloc::kMinGinContextCnt, max_ctx);
     num_allocated_qps = ctx;
 
     gin_alloc::GinResourceConfig gin_config = {};
@@ -45,7 +49,6 @@ static gin_alloc::GinResourceConfig configure_unordered_gin(const ncclComm_t& co
     if (not with_gin)
         return gin_config;
 
-    const int num_rdma_ranks = ncclTeamRail(comm).nRanks;
     EP_HOST_ASSERT(num_ranks == ncclTeamLsa(comm).nRanks * num_rdma_ranks);
 
     const ncclDevCommRequirements_t default_reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
