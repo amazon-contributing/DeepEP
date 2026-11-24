@@ -280,10 +280,14 @@ class ElasticBuffer:
             num_allocated_qps: the number of QPs to allocate for RDMA. One GIN context supplies
                 one QP, so this is also the GIN context count. Pass 0 for automatic, which
                 resolves per hybrid kernel mode (see `EP_HYBRID_KERNEL`):
-                  - unordered (default): 11 QPs and 21 signals per QP, for the balance
-                    between token batch size and the number of QPs. An explicit value
-                    is clamped into [2, 17] with a warning. Requesting fewer
-                    QPs gives each context more signals.
+                  - unordered (default): 13 QPs and 17 signals per QP, which gives a kernel on up
+                    to 12 SMs one data QP per SM after the notify QP; on an NCCL without the
+                    thread-exclusive put (before 2.32.6), where the previous kernel generation
+                    runs, 11 QPs and 21 signals per QP as before. An explicit value is
+                    clamped into [2, 41] with a warning; `num_sms + 1` gives every SM its own QP
+                    (the combine proxy then posts thread-exclusively). More QPs leave fewer
+                    signals per QP, `(256 - 2 * qps) / qps`, and every QP needs one per peer
+                    node, so the count is also clamped to 28 QPs at 8 nodes and 15 at 16.
                   - ordered: 129 QPs. This mode signals through VA/strong signals rather than
                     the indexed-signal budget, so any explicit value passes through
                     without restriction.
