@@ -19,6 +19,7 @@ public:
         int num_scaleout_ranks, num_scaleup_ranks;
         int64_t num_timeout_cycles;
         bool sequential;
+        bool use_unordered_kernel;
 
         // Parameters
         jit::NoRefPtr nccl_dev_comm;
@@ -31,14 +32,15 @@ public:
 
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
-#include <deep_ep/impls/barrier.cuh>
+#include <deep_ep/impls/{}>
 
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&barrier_impl<{}, {}, {}, {}, {}, {}, {}>);
 }}
-)",                        args.is_scaleup_nvlink,
+)",                        args.use_unordered_kernel ? "barrier_unordered.cuh" : "barrier.cuh",
+                           args.is_scaleup_nvlink,
                            args.launch_args.grid_dim.first, args.launch_args.num_threads,
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
                            args.num_timeout_cycles, args.sequential);
@@ -60,6 +62,7 @@ static void launch_barrier(const jit::NoRefPtr& nccl_dev_comm, const ncclWindow_
                            const int64_t& num_timeout_cycles,
                            const bool& is_scaleup_nvlink,
                            const bool& sequential,
+                           const bool& use_unordered_kernel,
                            const at::cuda::CUDAStream& stream) {
     // Number of threads equals to the number of ranks
     constexpr auto kNumThreads = 512;
@@ -73,6 +76,7 @@ static void launch_barrier(const jit::NoRefPtr& nccl_dev_comm, const ncclWindow_
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .num_timeout_cycles = num_timeout_cycles,
         .sequential = sequential,
+        .use_unordered_kernel = use_unordered_kernel,
         .nccl_dev_comm = nccl_dev_comm,
         .nccl_window = nccl_window,
         .workspace = workspace,

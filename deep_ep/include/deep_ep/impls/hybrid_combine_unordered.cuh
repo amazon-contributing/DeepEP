@@ -11,13 +11,14 @@
 //
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-#include <deep_ep/common/comm.cuh>
+#include <deep_ep/common/comm_unordered.cuh>
 #include <deep_ep/common/diag_gin.cuh>
 #include <deep_ep/common/layout.cuh>
+#include <deep_ep/common/layout_unordered.cuh>
 #include <deep_ep/common/math.cuh>
 #include <deep_ep/common/ptx.cuh>
 #include <deep_ep/impls/combine_utils.cuh>
-#include <deep_ep/impls/proxy_ring.cuh>
+#include <deep_ep/impls/proxy_ring_unordered.cuh>
 
 namespace deep_ep::elastic {
 
@@ -123,7 +124,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         (warp_idx % kNumChannelsPerSM) :
         (lane_idx < kNumForwardWarps ? lane_idx : 0);
     const auto [qp_idx, sharing_mode] =
-        comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, gin_channel_in_sm);
+        comm::unordered::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, gin_channel_in_sm);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
     // Flush the previous kernel's puts before this kernel writes `buffer`. Flush all the contexts, as
@@ -131,7 +132,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     // it runs the scale-up leg, and a flush on it delays that leg. The grid sync at the start of the
     // entry barrier makes all the SMs wait for the flushes.
     if (sm_idx > 0)
-        comm::flush_gin_contexts<(kNumSMs - 1) * (kNumThreads / 32), kNumTimeoutCycles>(
+        comm::unordered::flush_gin_contexts<(kNumSMs - 1) * (kNumThreads / 32), kNumTimeoutCycles>(
             nccl_dev_comm, nccl_dev_comm.ginContextCount, (sm_idx - 1) * (kNumThreads / 32) + warp_idx);
 
     // Debug check: the GIN signals must be in the expected state before the entry barrier
@@ -140,8 +141,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
     // Global parallel barriers for scale-out subteam and scale-up subteam
     // NOTES: this barrier needs a grid sync, as there are channel scale-up tail cleaning before
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridCombineTag0, false, true, true>(
+    comm::unordered::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
+                                 kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridCombineTag0, false, true, true>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
 
     // Adjust register count at certain cases
@@ -407,7 +408,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         // unique among all channels sharing this warp's QP, regardless of which of
         // `get_qp_mode`'s branches picked the mapping.
         const auto signal_id = static_cast<ncclGinSignal_t>(
-            comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
+            comm::unordered::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
 
         // Adjust registers
         if constexpr (kAdjustRegisters)
@@ -458,7 +459,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                            "channel: %d, forward warp: %d, dst: %d, head: %u, tail: %u, depth: %d\n",
                            scaleout_rank_idx, scaleup_rank_idx, channel_idx, forward_warp_idx,
                            dst, my_head, ring_tail, kProxyRingDepth);
-                    comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
+                    comm::unordered::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
                 }
                 return false;
             });
@@ -786,8 +787,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             const auto shadow_ptr = gin.gin.getSignalShadowPtr(signal_id);
             const auto target = (*shadow_ptr += static_cast<uint64_t>(num_expected_arrivals));
             comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-                const auto signal = gin.gin.readSignal(signal_id, comm::kNumSignalBits, cuda::memory_order_acquire);
-                if (comm::signal_delta(signal, target) >= 0)
+                const auto signal = gin.gin.readSignal(signal_id, comm::unordered::kNumSignalBits, cuda::memory_order_acquire);
+                if (comm::unordered::signal_delta(signal, target) >= 0)
                     return true;
 
                 if (is_last_check) {
@@ -795,7 +796,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                            "channel: %d, signal: %lu, target: %lu\n",
                            scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
                            channel_idx, signal, target);
-                    comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
+                    comm::unordered::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
                 }
                 return false;
             });
@@ -836,9 +837,9 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 #pragma unroll
                 for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx) {
                     ring_signal_id[forward_warp_idx] = static_cast<ncclGinSignal_t>(
-                        comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
+                        comm::unordered::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
                     const auto [qp, mode] =
-                        comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx);
+                        comm::unordered::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx);
                     new (&gin_ctx[forward_warp_idx]) handle::NCCLGin(nccl_dev_comm, nccl_window, qp, mode);
                 }
 
@@ -888,7 +889,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             if (lane_idx < kNumForwardWarps) {
                 const auto channel_idx = sm_idx * kNumChannelsPerSM + lane_idx;
                 const auto signal_id = static_cast<ncclGinSignal_t>(
-                    comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, lane_idx));
+                    comm::unordered::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, lane_idx));
 
                 ProxyPutDesc* const ring = proxy_ring_layout.get_ring(lane_idx);
                 unsigned tail = 0;

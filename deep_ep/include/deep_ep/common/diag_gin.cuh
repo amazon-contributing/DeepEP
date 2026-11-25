@@ -14,7 +14,7 @@
 
 #include <nccl_device.h>
 
-#include <deep_ep/common/comm.cuh>
+#include <deep_ep/common/comm_unordered.cuh>
 #include <deep_ep/common/ptx.cuh>
 
 namespace deep_ep::elastic::diag {
@@ -47,13 +47,13 @@ __device__ __forceinline__ void check_gin_signals(const ncclDevComm_t& nccl_dev_
         const auto signal_id = static_cast<ncclGinSignal_t>(signal_idx);
         const ncclGin gin(nccl_dev_comm, context_idx);
 
-        // The counter can wrap, so compare only the low `comm::kNumSignalBits` bits, the same as the
+        // The counter can wrap, so compare only the low `comm::unordered::kNumSignalBits` bits, the same as the
         // waits of the kernels: `readSignal` returns these bits of the counter, the mask keeps these
         // bits of the shadow, and `signal_delta` takes the difference with wrap. Nothing is read after
         // the signal, so the read can be relaxed
-        const auto shadow = *gin.getSignalShadowPtr(signal_id) & ((uint64_t{1} << comm::kNumSignalBits) - 1);
-        const auto signal = gin.readSignal(signal_id, comm::kNumSignalBits, cuda::memory_order_relaxed);
-        const auto skew = comm::signal_delta(signal, shadow);
+        const auto shadow = *gin.getSignalShadowPtr(signal_id) & ((uint64_t{1} << comm::unordered::kNumSignalBits) - 1);
+        const auto signal = gin.readSignal(signal_id, comm::unordered::kNumSignalBits, cuda::memory_order_relaxed);
+        const auto skew = comm::unordered::signal_delta(signal, shadow);
         if (skew < 0 or skew > (context_idx == 0 ? 1 : 0)) {
             printf("DeepEP debug check: GIN signal skew at kernel entry, rank: %d, context: %d, signal: %d, "
                    "shadow: %llu, counter: %llu, skew: %lld\n",
