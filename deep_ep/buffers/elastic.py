@@ -284,10 +284,13 @@ class ElasticBuffer:
                     to 12 SMs one data QP per SM after the notify QP; on an NCCL without the
                     thread-exclusive put (before 2.32.6), where the previous kernel generation
                     runs, 11 QPs and 21 signals per QP as before. An explicit value is
-                    clamped into [2, 41] with a warning; `num_sms + 1` gives every SM its own QP
-                    (the combine proxy then posts thread-exclusively). More QPs leave fewer
-                    signals per QP, `(256 - 2 * qps) / qps`, and every QP needs one per peer
-                    node, so the count is also clamped to 28 QPs at 8 nodes and 15 at 16.
+                    clamped into [2, 41] with a warning ([2, 17] before 2.32.6, as before);
+                    `num_sms + 1` gives every SM its own QP (the combine proxy then posts
+                    thread-exclusively). More QPs leave fewer signals per QP,
+                    `(256 - 2 * qps) / qps`, and every QP needs one per peer node, so the count
+                    is also clamped to 28 QPs at 8 nodes and 15 at 16. So `num_sms + 1` keeps 7
+                    channels per SM up to 27 SMs (14 at 16 nodes); above that the channels per
+                    SM drop (6 at 28 SMs, 4 at 40), and past the node clamp SMs share QPs again.
                   - ordered: 129 QPs. This mode signals through VA/strong signals rather than
                     the indexed-signal budget, so any explicit value passes through
                     without restriction.
