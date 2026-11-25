@@ -37,10 +37,12 @@ static gin_alloc::GinResourceConfig configure_unordered_gin(const ncclComm_t& co
     const int requested = num_allocated_qps != 0 ? num_allocated_qps
                         : use_thread_put_unordered_kernels() ? gin_alloc::kDefaultGinContextCnt
                         : gin_alloc::kLegacyGinContextCnt;
-    // Fewer on a larger rail: each context needs one signal per peer rail rank
+    // Fewer on a larger rail: each context needs one signal per peer rail rank. The previous
+    // kernel generation keeps main's ceiling, so below 2.32.6 the layout is exactly main's.
     const int num_rdma_ranks = ncclTeamRail(comm).nRanks;
-    const int max_ctx = num_rdma_ranks > 1 ? gin_alloc::max_gin_context_cnt_for_rail(num_rdma_ranks)
-                                           : gin_alloc::kMaxGinContextCnt;
+    const int max_ctx = not use_thread_put_unordered_kernels() ? gin_alloc::kLegacyMaxGinContextCnt
+                      : num_rdma_ranks > 1 ? gin_alloc::max_gin_context_cnt_for_rail(num_rdma_ranks)
+                      : gin_alloc::kMaxGinContextCnt;
     const int ctx = std::clamp(requested, gin_alloc::kMinGinContextCnt, max_ctx);
     if (ctx != requested)
         printf("[WARN] DeepEP clamped num_allocated_qps from %d to %d: the unordered "
