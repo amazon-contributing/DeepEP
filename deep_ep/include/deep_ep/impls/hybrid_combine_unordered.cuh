@@ -20,8 +20,10 @@
 #include <deep_ep/impls/combine_utils.cuh>
 #include <deep_ep/impls/proxy_ring_unordered.cuh>
 
+// The JIT passes the batch per architecture (csrc/jit/compiler.hpp): 12, except 6 on SM100, the
+// only GPU whose sweep had an interior optimum. A build without the JIT takes the common value.
 #ifndef EP_COMBINE_BATCH_SIZE
-#define EP_COMBINE_BATCH_SIZE 6
+#define EP_COMBINE_BATCH_SIZE 12
 #endif
 
 namespace deep_ep::elastic {
@@ -207,17 +209,21 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     constexpr int kNumRegistersForForwardWarps =
         kNumRegistersForWarpPair - kNumRegistersForScaleupWarps;
 
+    // Each data warp rebuilds its TMA buffer handle after the role split instead of keeping the pre-split
+    // one live. As a kernel-wide value it is the register ptxas spills first when the forward warp's ring
+    // wait adds a loop-carried value, and its reloads land on the per-token TMA paths of both data warps.
+    // The warp index is re-read through an opaque asm so the compiler cannot merge the rebuilt handle
+    // with the one computed before the split.
+    const auto rebuild_tma_buffer = [&]() {
+        unsigned opaque_tid;
+        asm volatile("mov.u32 %0, %%tid.x;" : "=r"(opaque_tid));
+        return tma_buffer_layout.get_rank_buffer(static_cast<int>(opaque_tid >> 5)).get_token_buffer(0);
+    };
+
     // Different warp roles
     if (warp_idx < kNumScaleupWarps) {
         const auto channel_idx = sm_idx * kNumChannelsPerSM + warp_idx;
-        // Rebuild this warp's TMA buffer handle here instead of keeping the pre-split one live across
-        // the role split. As a kernel-wide value it is the register ptxas spills first when the
-        // forward warp's ring wait adds a loop-carried value, and its reloads land on the per-token
-        // TMA paths of both data warps. The warp index is re-read through an opaque asm so the
-        // compiler cannot merge this handle with the one computed before the split.
-        unsigned opaque_tid;
-        asm volatile("mov.u32 %0, %%tid.x;" : "=r"(opaque_tid));
-        const auto tma_buffer = tma_buffer_layout.get_rank_buffer(static_cast<int>(opaque_tid >> 5)).get_token_buffer(0);
+        const auto tma_buffer = rebuild_tma_buffer();
         const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
 
         // Adjust registers
@@ -469,14 +475,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     } else if (warp_idx < kNumDataWarps) {
         const auto forward_warp_idx = warp_idx - kNumScaleupWarps;
         const auto channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
-        // Rebuild this warp's TMA buffer handle here instead of keeping the pre-split one live across
-        // the role split. As a kernel-wide value it is the register ptxas spills first when the
-        // forward warp's ring wait adds a loop-carried value, and its reloads land on the per-token
-        // TMA paths of both data warps. The warp index is re-read through an opaque asm so the
-        // compiler cannot merge this handle with the one computed before the split.
-        unsigned opaque_tid;
-        asm volatile("mov.u32 %0, %%tid.x;" : "=r"(opaque_tid));
-        const auto tma_buffer = tma_buffer_layout.get_rank_buffer(static_cast<int>(opaque_tid >> 5)).get_token_buffer(0);
+        const auto tma_buffer = rebuild_tma_buffer();
         const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
 
         // Adjust registers
