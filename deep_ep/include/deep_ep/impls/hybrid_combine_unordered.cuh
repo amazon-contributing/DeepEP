@@ -877,6 +877,12 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             // This lane is the only poster on a QP this SM owns (CTA in the mapping), so the
             // handle can be thread-exclusive where the NCCL implements the thread-exclusive Put;
             // otherwise, and on a QP shared across SMs, it keeps the mapped mode.
+            //
+            // Known gap: the default 13 GIN contexts give each SM its own QP only up to 12 SMs. Above
+            // that, unless the caller passes `num_allocated_qps = num_sms + 1`, SMs share QPs and this
+            // lane posts every put of the SM on the GPU-shared path, one at a time, which is slower than
+            // main (B300, 20 SMs). Megatron never sets `num_allocated_qps`. A default that follows the
+            // SM count is a follow-up.
             const auto rail_mode = mapped_mode == NCCL_GIN_RESOURCE_SHARING_CTA and comm::unordered::kNcclHasThreadPut
                                  ? NCCL_GIN_RESOURCE_SHARING_THREAD
                                  : mapped_mode;
