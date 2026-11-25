@@ -920,8 +920,9 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                         any_ring_finished = true;
                 }
 
-                // Wait for one descriptor per forward warp, then send them all under one
-                // doorbell. A floor, not a cap. Exempt in the tail, which would wait forever.
+                // Wait until as many descriptors as there are forward warps are pending in total
+                // (any mix of rings), then send them all under one doorbell. A floor, not a cap.
+                // Exempt in the tail, which would wait forever.
                 const bool drain_now = total_pending > 0 and
                                        (total_pending >= kNumForwardWarps or any_ring_finished);
 
