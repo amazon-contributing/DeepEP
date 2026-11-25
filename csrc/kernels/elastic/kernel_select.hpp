@@ -19,16 +19,16 @@
 
 namespace deep_ep::elastic {
 
-// `EP_HYBRID_KERNEL` selects the hybrid (scale-out) kernels: "ordered" (default) assumes in-order
-// delivery and uses GIN strong signals, "unordered" does not and uses GIN weak signals
+// `EP_HYBRID_KERNEL` selects the hybrid (scale-out) kernels: "unordered" (default) does not assume
+// in-order delivery and uses GIN weak signals, "ordered" does and uses GIN strong signals
 inline bool use_unordered_hybrid_kernel() {
     static const bool unordered = [] {
         const auto value = get_env<std::string>("EP_HYBRID_KERNEL");
-        bool result = false;
-        if (value.empty() or value == "ordered") {
-            result = false;
-        } else if (value == "unordered") {
+        bool result = true;
+        if (value.empty() or value == "unordered") {
             result = true;
+        } else if (value == "ordered") {
+            result = false;
         } else {
             EP_HOST_ASSERT(false and "EP_HYBRID_KERNEL must be `ordered` or `unordered`");
         }

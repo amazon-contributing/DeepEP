@@ -340,7 +340,7 @@ class ElasticBuffer:
             sl_idx = int(os.environ['EP_OVERRIDE_RDMA_SL'])
 
         # Hybrid kernel variant
-        hybrid_kernel = os.environ.get('EP_HYBRID_KERNEL') or 'ordered'
+        hybrid_kernel = os.environ.get('EP_HYBRID_KERNEL') or 'unordered'
         assert hybrid_kernel in ('ordered', 'unordered'), \
             f'EP_HYBRID_KERNEL must be `ordered` or `unordered`, got `{hybrid_kernel}`'
 

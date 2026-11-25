@@ -341,7 +341,7 @@ The library provides some environment variables, which may be useful:
     - `EP_NIC_NAME`: string, the default NIC name used to query NIC properties, `mlx5_0` by default
     - `EP_OVERRIDE_RDMA_SL`: integer, override the RDMA service level index for traffic isolation
     - `EP_DISABLE_GIN`: `0` or `1`, disable the NCCL Gin backend (fall back to non-Gin path), `0` by default
-    - `EP_HYBRID_KERNEL`: `ordered` or `unordered`, select the hybrid (scale-out) dispatch/combine kernel pair, `ordered` by default. See [Hybrid kernel variants](#hybrid-kernel-variants-ordered-and-unordered)
+    - `EP_HYBRID_KERNEL`: `ordered` or `unordered`, select the hybrid (scale-out) dispatch/combine kernel pair, `unordered` by default. See [Hybrid kernel variants](#hybrid-kernel-variants-ordered-and-unordered)
 - JIT
     - `EP_JIT_DEBUG`: `0` or `1`, print JIT debugging information, `0` by default
     - `EP_JIT_CACHE_DIR`: string, cache directory for compiled kernels, `$HOME/.deep_ep` by default
@@ -408,8 +408,8 @@ sudo mlxconfig -y -d mlx5_$i set PCI_ATOMIC_MODE=4
 
 `EP_HYBRID_KERNEL` selects the hybrid (scale-out) dispatch and combine kernels and the preparation around them. Direct mode is not affected by this setting.
 
-- `EP_HYBRID_KERNEL=ordered` (default). Assumes the network delivers data in order, and is built around NCCL GIN strong signals.
-- `EP_HYBRID_KERNEL=unordered`. Makes no assumption about delivery order, and is built around NCCL GIN weak signals. Requires NCCL 2.31.2 or later.
+- `EP_HYBRID_KERNEL=ordered`. Assumes the network delivers data in order, and is built around NCCL GIN strong signals.
+- `EP_HYBRID_KERNEL=unordered` (default). Makes no assumption about delivery order, and is built around NCCL GIN weak signals. Requires NCCL 2.31.2 or later.
 
 ## Running on AWS EFA
 
