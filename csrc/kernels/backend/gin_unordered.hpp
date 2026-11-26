@@ -20,6 +20,8 @@
 #include <deep_ep/common/exception.cuh>
 #include <deep_ep/common/gin_resource_alloc_unordered.cuh>
 
+#include "../elastic/kernel_select.hpp"
+
 #include "../../utils/system.hpp"
 
 namespace deep_ep::elastic {
@@ -32,12 +34,20 @@ static gin_alloc::GinResourceConfig configure_unordered_gin(const ncclComm_t& co
     EP_HOST_ASSERT(false and "EP_HYBRID_KERNEL=unordered requires NCCL 2.31.2 or later");
 #endif
 
-    const int requested = num_allocated_qps == 0 ? gin_alloc::kDefaultGinContextCnt : num_allocated_qps;
-    const int ctx = std::clamp(requested, gin_alloc::kMinGinContextCnt, gin_alloc::kMaxGinContextCnt);
+    const int requested = num_allocated_qps != 0 ? num_allocated_qps
+                        : use_thread_put_unordered_kernels() ? gin_alloc::kDefaultGinContextCnt
+                        : gin_alloc::kLegacyGinContextCnt;
+    // Fewer on a larger rail: each context needs one signal per peer rail rank. The previous
+    // kernel generation keeps main's ceiling, so below 2.32.6 the layout is exactly main's.
+    const int num_rdma_ranks = ncclTeamRail(comm).nRanks;
+    const int max_ctx = not use_thread_put_unordered_kernels() ? gin_alloc::kLegacyMaxGinContextCnt
+                      : num_rdma_ranks > 1 ? gin_alloc::max_gin_context_cnt_for_rail(num_rdma_ranks)
+                      : gin_alloc::kMaxGinContextCnt;
+    const int ctx = std::clamp(requested, gin_alloc::kMinGinContextCnt, max_ctx);
     if (ctx != requested)
         printf("[WARN] DeepEP clamped num_allocated_qps from %d to %d: the unordered "
                "GIN layout supports [%d, %d] contexts (one GIN context supplies one QP)\n",
-               requested, ctx, gin_alloc::kMinGinContextCnt, gin_alloc::kMaxGinContextCnt);
+               requested, ctx, gin_alloc::kMinGinContextCnt, max_ctx);
     num_allocated_qps = ctx;
 
     gin_alloc::GinResourceConfig gin_config = {};
@@ -45,7 +55,6 @@ static gin_alloc::GinResourceConfig configure_unordered_gin(const ncclComm_t& co
     if (not with_gin)
         return gin_config;
 
-    const int num_rdma_ranks = ncclTeamRail(comm).nRanks;
     EP_HOST_ASSERT(num_ranks == ncclTeamLsa(comm).nRanks * num_rdma_ranks);
 
     const ncclDevCommRequirements_t default_reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;

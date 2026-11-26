@@ -277,7 +277,23 @@ class ElasticBuffer:
             allow_multiple_reduction: whether to allow multiple reductions in combine.
             prefer_overlap_with_compute: whether to prefer overlapping communication with compute.
             sl_idx: the RDMA service level index, can be overridden by `EP_OVERRIDE_RDMA_SL` env var.
-            num_allocated_qps: the number of QPs to allocate for RDMA (0 for automatic).
+            num_allocated_qps: the number of QPs to allocate for RDMA. One GIN context supplies
+                one QP, so this is also the GIN context count. Pass 0 for automatic, which
+                resolves per hybrid kernel mode (see `EP_HYBRID_KERNEL`):
+                  - unordered (default): 13 QPs and 17 signals per QP, which gives a kernel on up
+                    to 12 SMs one data QP per SM after the notify QP; on an NCCL without the
+                    thread-exclusive put (before 2.32.6), where the previous kernel generation
+                    runs, 11 QPs and 21 signals per QP as before. An explicit value is
+                    clamped into [2, 41] with a warning ([2, 17] before 2.32.6, as before);
+                    `num_sms + 1` gives every SM its own QP (the combine proxy then posts
+                    thread-exclusively). More QPs leave fewer signals per QP,
+                    `(256 - 2 * qps) / qps`, and every QP needs one per peer node, so the count
+                    is also clamped to 28 QPs at 8 nodes and 15 at 16. So `num_sms + 1` keeps 7
+                    channels per SM up to 27 SMs (14 at 16 nodes); above that the channels per
+                    SM drop (6 at 28 SMs, 4 at 40), and past the node clamp SMs share QPs again.
+                  - ordered: 129 QPs. This mode signals through VA/strong signals rather than
+                    the indexed-signal budget, so any explicit value passes through
+                    without restriction.
             num_cpu_timeout_secs: CPU-side timeout in seconds for CPU sync.
             num_gpu_timeout_secs: GPU-side timeout in seconds for GPU operations.
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
